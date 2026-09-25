@@ -1,7 +1,7 @@
 // axiosInstance.ts
 import axios from "axios";
 
-const BASE_URL = "http://localhost:5015/api";
+const BASE_URL = "https://queueless-for-churches.onrender.com/api";
 
 // Base path Vite is serving the app under ("/admin"). Strip trailing slash.
 const BASE_PATH = import.meta.env.BASE_URL.replace(/\/$/, "");

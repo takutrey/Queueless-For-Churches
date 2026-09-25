@@ -19,13 +19,15 @@ class SocketService {
       return;
     }
 
-    const rawUrl = import.meta.env.VITE_API_URL ?? "http://localhost:5015";
+    const rawUrl =
+      import.meta.env.VITE_API_URL ??
+      "https://queueless-for-churches.onrender.com";
     const serverOrigin = (() => {
       try {
         const u = new URL(rawUrl);
         return `${u.protocol}//${u.host}`;
       } catch {
-        return "http://localhost:5015";
+        return "https://queueless-for-churches.onrender.com";
       }
     })();
 

@@ -2,7 +2,9 @@
 import axios from "axios";
 
 // Use environment variable with fallback
-const BASE_URL = import.meta.env.VITE_API_URL || "http://localhost:5015/api";
+const BASE_URL =
+  import.meta.env.VITE_API_URL ||
+  "https://queueless-for-churches.onrender.com/api";
 const DEVICE_ID_KEY = "queueless-device-id";
 
 function getDeviceId() {
