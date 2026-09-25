@@ -242,6 +242,7 @@ module.exports = {
   generateJoinCode,
   validateQueuePrefix,
   formatTicketNumber,
+  getActiveChurch,
   getQueueStaffAssignment,
   getChurchQueue,
   getChurchUser,
