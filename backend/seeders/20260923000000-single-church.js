@@ -27,7 +27,7 @@ module.exports = {
     );
 
     await queryInterface.bulkInsert(
-      "churchsettings",
+      "churchSettings",
       [
         {
           id: SETTINGS_ID,
