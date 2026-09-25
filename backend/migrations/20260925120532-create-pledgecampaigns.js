@@ -14,10 +14,6 @@ module.exports = {
           type: DataTypes.UUID,
           allowNull: false
         },
-        businessId: {
-          type: DataTypes.UUID,
-          allowNull: true
-        },
         title: {
           type: DataTypes.STRING(160),
           allowNull: false
