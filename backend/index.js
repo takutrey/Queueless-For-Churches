@@ -124,10 +124,10 @@ app.use((req, res, next) => {
           "default-src 'self'",
           "script-src 'self' 'unsafe-inline' 'unsafe-eval' https://cdnjs.cloudflare.com",
           "worker-src 'self' blob:", // ← was just "blob:" — this blocked /admin/sw.js
-          "style-src 'self' 'unsafe-inline' https://api.mapbox.com https://cdnjs.cloudflare.com",
+          "style-src 'self' 'unsafe-inline' https://api.mapbox.com https://cdnjs.cloudflare.com https://fonts.googleapis.com",
           "img-src 'self' data: blob: https://*.mapbox.com https://a.tile.openstreetmap.org https://b.tile.openstreetmap.org https://c.tile.openstreetmap.org",
           "connect-src 'self' https://*.mapbox.com https://events.mapbox.com wss://*.mapbox.com https://nominatim.openstreetmap.org https://api.mapbox.com https://a.tile.openstreetmap.org https://b.tile.openstreetmap.org https://c.tile.openstreetmap.org",
-          "font-src 'self' data: https://*.mapbox.com https://cdnjs.cloudflare.com",
+          "font-src 'self' data: https://*.mapbox.com https://cdnjs.cloudflare.com https://fonts.gstatic.com",
         ].join("; ")
       : "default-src * 'unsafe-inline' 'unsafe-eval' data: blob:",
   );
@@ -168,17 +168,22 @@ app.use((err, req, res, next) => {
 
 app.use(express.static("public"));
 
-// WEB
-app.use(express.static(path.join(__dirname, "website/dist")));
-
-app.get(/.*/, (req, res) => {
-  res.sendFile(path.join(__dirname, "website/dist", "index.html"));
-});
-// ADMIN
+// ADMIN — registered before the public wildcard catch-all below, since a
+// broad regex/wildcard route shadows any more-specific route registered
+// after it. Previously this block sat after the public catch-all and was
+// unreachable: every request to /admin/* was being swallowed by the public
+// site's app.get(/.*/, ...) first.
 app.use("/admin", express.static(path.join(__dirname, "admin/dist")));
 
 app.get(/^\/admin(\/.*)?$/, (req, res) => {
   res.sendFile(path.join(__dirname, "admin/dist", "index.html"));
+});
+
+// WEB — public catch-all, must stay last since /.*/ matches everything.
+app.use(express.static(path.join(__dirname, "website/dist")));
+
+app.get(/.*/, (req, res) => {
+  res.sendFile(path.join(__dirname, "website/dist", "index.html"));
 });
 
 // ── Start server ────────────────────────────────────────
