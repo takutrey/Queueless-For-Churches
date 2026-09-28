@@ -29,53 +29,96 @@ const app = express();
 const server = http.createServer(app);
 
 // ── CORS Configuration ──────────────────────────────────
-const allowedOrigins = [
-  process.env.CLIENT_URL,
-  process.env.CLIENT_URLS,
-  process.env.HOST_URL,
-].filter(Boolean);
+const isDev = process.env.NODE_ENV !== "production";
 
-const corsOptions = {
-  origin: function (origin, callback) {
-    if (!origin) return callback(null, true);
-    if (
-      allowedOrigins.indexOf(origin) !== -1 ||
-      process.env.NODE_ENV !== "production"
-    ) {
-      callback(null, true);
-    } else {
-      console.warn(`CORS blocked origin: ${origin}`);
-      callback(new Error("Not allowed by CORS"));
-    }
-  },
-  credentials: true,
-  methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
-  allowedHeaders: [
-    "Content-Type",
-    "Authorization",
-    "X-Requested-With",
-    "X-Device-Id",
-    "Idempotency-Key",
-    "X-Pledge-Receipt-Key",
-  ],
-  exposedHeaders: ["Set-Cookie"],
-  optionsSuccessStatus: 200,
+// Turn "https://example.com/" or "HTTPS://Example.com/path" into the exact
+// value browsers send in the Origin header ("https://example.com").
+// Returns null for anything that is not a full URL (e.g. "localhost:5173").
+const normalizeOrigin = (value) => {
+  if (!value || typeof value !== "string") return null;
+  try {
+    const { origin } = new URL(value.trim());
+    return origin === "null" ? null : origin;
+  } catch {
+    return null;
+  }
+};
+
+// Env vars may hold one URL or a comma-separated list.
+const parseOriginList = (value) =>
+  (value || "").split(",").map(normalizeOrigin).filter(Boolean);
+
+// Explicit allowlist (for a frontend hosted on a DIFFERENT origin, e.g. a
+// custom domain or a local dev server). RENDER_EXTERNAL_URL is set
+// automatically by Render, so the deployed URL is always included.
+const allowedOrigins = [
+  ...new Set([
+    ...parseOriginList(process.env.CLIENT_URL),
+    ...parseOriginList(process.env.CLIENT_URLS),
+    ...parseOriginList(process.env.HOST_URL),
+    ...parseOriginList(process.env.RENDER_EXTERNAL_URL),
+  ]),
+];
+
+// The admin dashboard and public site are served by THIS server, so their
+// requests are same-origin. Browsers still attach an Origin header to
+// same-origin POST/PUT/PATCH/DELETE requests, so we must recognise them.
+const isSameOrigin = (origin, req) => {
+  try {
+    const host = (req.headers.host || "").toLowerCase();
+    return !!host && new URL(origin).host.toLowerCase() === host;
+  } catch {
+    return false;
+  }
+};
+
+const isOriginAllowed = (origin, req) => {
+  if (!origin) return true; // same-origin navigation, curl, server-to-server
+  if (isDev) return true;
+  if (allowedOrigins.includes(normalizeOrigin(origin))) return true;
+  return isSameOrigin(origin, req);
+};
+
+// Per-request options so we can compare Origin against this request's Host.
+// allowedHeaders is intentionally omitted: the cors package then echoes
+// whatever headers the browser asks for in the preflight, so adding a new
+// custom header on the client (Idempotency-Key, X-Pledge-Receipt-Key, ...)
+// never requires a server change.
+const corsOptionsDelegate = (req, callback) => {
+  const origin = req.header("Origin");
+
+  if (!isOriginAllowed(origin, req)) {
+    console.warn(`CORS blocked origin: ${origin} (host: ${req.headers.host})`);
+    return callback(new Error("Not allowed by CORS"));
+  }
+
+  callback(null, {
+    origin: true, // reflect the request origin (needed with credentials)
+    credentials: true,
+    methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+    maxAge: 600, // let browsers cache preflight results for 10 minutes
+    optionsSuccessStatus: 200,
+  });
 };
 
 // ── Socket.io with proper CORS ──────────────────────────
 // Create a single Socket.IO server instance.
 const io = socketIo(server, {
   cors: {
-    origin: (origin, callback) => {
-      if (!origin) return callback(null, true);
-      if (allowedOrigins.length === 0 || allowedOrigins.includes(origin)) {
-        return callback(null, true);
-      }
-      if (process.env.NODE_ENV !== "production") return callback(null, true);
-      callback(new Error("CORS: origin not allowed"));
-    },
+    // Reflect the origin; the real gatekeeping happens in allowRequest below.
+    origin: true,
     methods: ["GET", "POST"],
     credentials: true,
+  },
+  // Runs on every new connection handshake, with access to the Host header,
+  // so same-origin and allowlisted origins pass and everything else is refused.
+  allowRequest: (req, callback) => {
+    const origin = req.headers.origin;
+    const allowed = isOriginAllowed(origin, req);
+    if (!allowed) {
+      console.warn(`Socket.IO blocked origin: ${origin}`);
+    }
+    callback(null, allowed);
   },
   pingTimeout: 60000,
   pingInterval: 25000,
@@ -109,7 +152,7 @@ db.sequelize
   .catch((error) => console.error("Database connection failed:", error));
 
 // ── Global middleware ──────────────────────────────────
-app.use(cors(corsOptions));
+app.use(cors(corsOptionsDelegate));
 app.use(cookieParser());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
@@ -125,10 +168,10 @@ app.use((req, res, next) => {
           "default-src 'self'",
           "script-src 'self' 'unsafe-inline' 'unsafe-eval' https://cdnjs.cloudflare.com",
           "worker-src 'self' blob:", // ← was just "blob:" — this blocked /admin/sw.js
-          "style-src 'self' 'unsafe-inline' https://api.mapbox.com https://cdnjs.cloudflare.com",
+          "style-src 'self' 'unsafe-inline' https://api.mapbox.com https://cdnjs.cloudflare.com https://fonts.googleapis.com",
           "img-src 'self' data: blob: https://*.mapbox.com https://a.tile.openstreetmap.org https://b.tile.openstreetmap.org https://c.tile.openstreetmap.org",
           "connect-src 'self' https://*.mapbox.com https://events.mapbox.com wss://*.mapbox.com https://nominatim.openstreetmap.org https://api.mapbox.com https://a.tile.openstreetmap.org https://b.tile.openstreetmap.org https://c.tile.openstreetmap.org",
-          "font-src 'self' data: https://*.mapbox.com https://cdnjs.cloudflare.com",
+          "font-src 'self' data: https://*.mapbox.com https://cdnjs.cloudflare.com https://fonts.gstatic.com",
         ].join("; ")
       : "default-src * 'unsafe-inline' 'unsafe-eval' data: blob:",
   );
@@ -169,17 +212,21 @@ app.use((err, req, res, next) => {
 
 app.use(express.static("public"));
 
-// WEB
-app.use(express.static(path.join(__dirname, "website/dist")));
-
-app.get(/.*/, (req, res) => {
-  res.sendFile(path.join(__dirname, "website/dist", "index.html"));
-});
-// ADMIN
+// ADMIN — must be registered BEFORE the public wildcard catch-all below.
+// A broad regex route shadows every more-specific route registered after it,
+// so with the old order every /admin/* request was answered by the public
+// site's index.html and the admin app was unreachable.
 app.use("/admin", express.static(path.join(__dirname, "admin/dist")));
 
 app.get(/^\/admin(\/.*)?$/, (req, res) => {
   res.sendFile(path.join(__dirname, "admin/dist", "index.html"));
+});
+
+// WEB — public catch-all, must stay last since /.*/ matches everything.
+app.use(express.static(path.join(__dirname, "website/dist")));
+
+app.get(/.*/, (req, res) => {
+  res.sendFile(path.join(__dirname, "website/dist", "index.html"));
 });
 
 // ── Start server ────────────────────────────────────────
@@ -187,7 +234,9 @@ const startServer = async () => {
   try {
     server.listen(process.env.APP_PORT || 3000, () => {
       console.log(`🚀 Server running on port ${process.env.APP_PORT || 3000}`);
-      console.log(`📍 CORS enabled for origins: ${allowedOrigins.join(", ")}`);
+      console.log(
+        `📍 CORS allowlist: ${allowedOrigins.join(", ") || "(none — same-origin only)"}`,
+      );
       console.log(`🔒 Environment: ${process.env.NODE_ENV || "development"}`);
     });
   } catch (error) {
