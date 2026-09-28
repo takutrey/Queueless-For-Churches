@@ -159,7 +159,6 @@ const getQueueService = async (queue, entry, transaction) => {
               ],
             },
           ],
-          order: [["createdAt", "ASC"]],
         });
 
         matchedPledges = pledges.map((pledge) => {
