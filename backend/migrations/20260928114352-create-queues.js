@@ -35,6 +35,15 @@ module.exports = {
           type: DataTypes.STRING,
           allowNull: true
         },
+        serviceType: {
+          type: DataTypes.ENUM("GENERAL", "PLEDGE_CAMPAIGN"),
+          allowNull: false,
+          defaultValue: "GENERAL"
+        },
+        campaignId: {
+          type: DataTypes.UUID,
+          allowNull: true
+        },
         status: {
           type: DataTypes.ENUM("open", "paused", "closed"),
           allowNull: false,

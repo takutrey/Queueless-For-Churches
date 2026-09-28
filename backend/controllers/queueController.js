@@ -7,19 +7,28 @@ const QueueEntry = db.queueEntries;
 const QueueStaff = db.queueStaff;
 const User = db.users;
 const Church = db.churches;
+const Campaign = db.pledgeCampaigns;
+const Pledge = db.pledges;
 
 const {
   generateUniqueSlug,
   generateQueuePrefix,
   generateJoinCode,
-  validateQueuePrefix,
   formatTicketNumber,
-  getActiveChurch,
+  getActiveCampaign,
+  getQueueCampaign,
   getChurchQueue,
   getChurchUser,
   getQueueStaffAssignment,
   getQueueStats,
+  getActiveChurch,
 } = require("../utils/queueHelpers");
+const {
+  normalizePhone,
+  getMatchStatus,
+} = require("../utils/queuePledgeHelpers");
+const { getPledgeRemaining } = require("../utils/pledgeHelpers");
+const { createPublicPledge } = require("./pledgeController");
 const canControlAnyQueue = (user) =>
   ["admin", "manager", "super-admin", "superadmin"].includes(user.role?.name);
 
@@ -27,6 +36,7 @@ const {
   createNotification,
   emitQueueEvent,
   emitChurchEvent,
+  emitPublicEvent,
   emitCustomerEvent,
 } = require("../utils/notificationHelper");
 
@@ -40,6 +50,160 @@ const ensureJoinCode = async (queue) => {
 
   await queue.update({ joinCode });
   return queue;
+};
+
+const queueCampaignInclude = {
+  model: Campaign,
+  as: "campaign",
+  required: false,
+  attributes: ["id", "title", "status"],
+  include: [
+    {
+      model: Church,
+      as: "church",
+      attributes: ["id"],
+      include: [
+        {
+          model: db.churchSettings,
+          as: "churchSettings",
+          attributes: ["currency"],
+          required: false,
+        },
+      ],
+    },
+  ],
+};
+
+const serializeQueue = (queue) => {
+  const result = queue.toJSON();
+  result.serviceType = result.serviceType || "GENERAL";
+  result.campaign = result.campaign
+    ? {
+        id: result.campaign.id,
+        title: result.campaign.title,
+        status: result.campaign.status,
+        ...(result.campaign.church?.churchSettings?.currency
+          ? { currency: result.campaign.church.churchSettings.currency }
+          : {}),
+      }
+    : null;
+  return result;
+};
+
+const serializePublicQueue = (queue, stats) => ({
+  id: queue.id,
+  churchId: queue.churchId,
+  name: queue.name,
+  slug: queue.slug,
+  joinCode: queue.joinCode,
+  prefix: queue.prefix,
+  description: queue.description,
+  status: queue.status,
+  currentNumber: queue.currentNumber,
+  nextNumber: queue.nextNumber,
+  estimatedServiceTime: queue.estimatedServiceTime,
+  maxCustomers: queue.maxCustomers,
+  allowWalkIns: queue.allowWalkIns,
+  serviceType: queue.serviceType || "GENERAL",
+  campaignTitle: queue.campaign?.title || null,
+  church: queue.church
+    ? { id: queue.church.id, name: queue.church.name }
+    : null,
+  stats,
+});
+
+const getQueueService = async (queue, entry, transaction) => {
+  const campaign = queue.campaignId
+    ? await getQueueCampaign(queue.campaignId, queue.churchId)
+    : null;
+  let matchedPledges = [];
+
+  if (queue.campaignId && entry.customerPhone) {
+    const phone = normalizePhone(entry.customerPhone);
+    if (phone) {
+      const candidates = await Pledge.findAll({
+        where: { campaignId: queue.campaignId },
+        attributes: ["id", "phone"],
+      });
+      const matchingIds = candidates
+        .filter((candidate) => normalizePhone(candidate.phone) === phone)
+        .map((candidate) => candidate.id);
+
+      if (matchingIds.length) {
+        const pledges = await Pledge.findAll({
+          where: { id: { [Op.in]: matchingIds }, campaignId: queue.campaignId },
+          attributes: [
+            "id",
+            "name",
+            "phone",
+            "monetaryAmount",
+            "fulfilledMonetaryAmount",
+            "status",
+          ],
+          include: [
+            {
+              model: db.pledgeItems,
+              as: "items",
+              attributes: [
+                "id",
+                "campaignItemId",
+                "quantity",
+                "fulfilledQuantity",
+              ],
+              include: [
+                {
+                  model: db.pledgeCampaignItems,
+                  as: "campaignItem",
+                  attributes: ["name", "unit"],
+                },
+              ],
+            },
+          ],
+          order: [["createdAt", "ASC"]],
+        });
+
+        matchedPledges = pledges.map((pledge) => {
+          const remaining = getPledgeRemaining(pledge);
+          return {
+            id: pledge.id,
+            name: pledge.name,
+            phone: pledge.phone,
+            monetaryAmount: pledge.monetaryAmount,
+            fulfilledMonetaryAmount: pledge.fulfilledMonetaryAmount,
+            remainingMonetaryAmount: remaining.monetaryRemaining,
+            status: pledge.status,
+            items: (pledge.items || []).map((item) => ({
+              id: item.id,
+              campaignItemId: item.campaignItemId,
+              name: item.campaignItem?.name || "Material item",
+              unit: item.campaignItem?.unit || "",
+              quantity: item.quantity,
+              fulfilledQuantity: item.fulfilledQuantity,
+              remainingQuantity:
+                remaining.items.find((entry) => entry.pledgeItemId === item.id)
+                  ?.remainingQuantity || "0.000",
+            })),
+          };
+        });
+      }
+    }
+  }
+
+  return {
+    type: "PLEDGE_CAMPAIGN",
+    campaign: campaign
+      ? {
+          id: campaign.id,
+          title: campaign.title,
+          status: campaign.status,
+          ...(campaign.church?.churchSettings?.currency
+            ? { currency: campaign.church.churchSettings.currency }
+            : {}),
+        }
+      : null,
+    matchedPledges,
+    matchStatus: getMatchStatus(matchedPledges),
+  };
 };
 
 const parseQueueCallRange = (payload = {}) => {
@@ -140,10 +304,10 @@ const createQueue = async (req, res) => {
     const {
       name,
       description,
-      prefix,
       estimatedServiceTime,
-      maxCustomers,
       allowWalkIns,
+      serviceType = "GENERAL",
+      campaignId,
     } = req.body;
 
     if (!churchId) {
@@ -164,6 +328,30 @@ const createQueue = async (req, res) => {
       return res.status(403).json({
         message: "Church not found or inactive",
       });
+    }
+
+    if (!["GENERAL", "PLEDGE_CAMPAIGN"].includes(serviceType)) {
+      return res.status(400).json({
+        message: "Service type must be GENERAL or PLEDGE_CAMPAIGN",
+      });
+    }
+
+    let campaign = null;
+    if (serviceType === "PLEDGE_CAMPAIGN") {
+      if (!campaignId) {
+        return res.status(400).json({
+          message: "A pledge campaign is required for this service type",
+        });
+      }
+      campaign = await getActiveCampaign(campaignId, churchId);
+      if (!campaign) {
+        const existingCampaign = await getQueueCampaign(campaignId, churchId);
+        return res.status(existingCampaign ? 400 : 404).json({
+          message: existingCampaign
+            ? "The selected campaign is not active"
+            : "The selected campaign was not found for this church",
+        });
+      }
     }
 
     const queueName = name.trim();
@@ -188,16 +376,7 @@ const createQueue = async (req, res) => {
     /**
      * Prefix
      */
-    let queuePrefix = prefix
-      ? prefix.trim().toUpperCase()
-      : generateQueuePrefix(queueName);
-
-    if (!validateQueuePrefix(queuePrefix)) {
-      return res.status(400).json({
-        message:
-          "Queue prefix must contain only letters or numbers and be between 1 and 5 characters",
-      });
-    }
+    const queuePrefix = generateQueuePrefix(queueName);
 
     /**
      * Service time
@@ -211,25 +390,6 @@ const createQueue = async (req, res) => {
       });
     }
 
-    /**
-     * Maximum customers
-     */
-    let maximumCustomers = null;
-
-    if (
-      maxCustomers !== undefined &&
-      maxCustomers !== null &&
-      maxCustomers !== ""
-    ) {
-      maximumCustomers = Number(maxCustomers);
-
-      if (!Number.isInteger(maximumCustomers) || maximumCustomers <= 0) {
-        return res.status(400).json({
-          message: "Maximum customers must be a positive number",
-        });
-      }
-    }
-
     const slug = await generateUniqueSlug(churchId, queueName);
 
     let joinCode = generateJoinCode();
@@ -240,6 +400,8 @@ const createQueue = async (req, res) => {
     const queue = await Queue.create({
       churchId,
       name: queueName,
+      serviceType,
+      campaignId: serviceType === "PLEDGE_CAMPAIGN" ? campaign.id : null,
       slug,
       joinCode,
       prefix: queuePrefix,
@@ -249,14 +411,20 @@ const createQueue = async (req, res) => {
       currentNumber: 0,
       nextNumber: 1,
       estimatedServiceTime: serviceTime,
-      maxCustomers: maximumCustomers,
+      maxCustomers: null,
       allowWalkIns: allowWalkIns !== undefined ? Boolean(allowWalkIns) : true,
     });
 
     /**
      * Socket
      */
+    if (campaign) queue.setDataValue("campaign", campaign);
     emitChurchEvent(churchId, "queue:created", queue);
+    queue.setDataValue("church", { id: church.id, name: church.name });
+    emitPublicEvent(
+      "public:queueCreated",
+      serializePublicQueue(queue, await getQueueStats(queue.id)),
+    );
 
     /**
      * Notification
@@ -270,7 +438,7 @@ const createQueue = async (req, res) => {
 
     return res.status(201).json({
       message: "Queue created successfully",
-      queue,
+      queue: serializeQueue(queue),
     });
   } catch (error) {
     console.error("Create queue error:", error);
@@ -301,6 +469,7 @@ const getQueues = async (req, res) => {
         churchId,
       },
       include: [
+        queueCampaignInclude,
         {
           model: QueueStaff,
           as: "staffAssignments",
@@ -324,7 +493,7 @@ const getQueues = async (req, res) => {
         const stats = await getQueueStats(queue.id);
 
         return {
-          ...queue.toJSON(),
+          ...serializeQueue(queue),
           stats,
         };
       }),
@@ -359,6 +528,7 @@ const getQueue = async (req, res) => {
         churchId,
       },
       include: [
+        queueCampaignInclude,
         {
           model: QueueEntry,
           as: "entries",
@@ -394,7 +564,7 @@ const getQueue = async (req, res) => {
     const stats = await getQueueStats(queue.id);
 
     return res.status(200).json({
-      queue,
+      queue: serializeQueue(queue),
       stats,
     });
   } catch (error) {
@@ -427,6 +597,12 @@ const listPublicQueues = async (req, res) => {
           as: "church",
           attributes: ["id", "name"],
         },
+        {
+          model: Campaign,
+          as: "campaign",
+          attributes: ["title"],
+          required: false,
+        },
       ],
       order: [["createdAt", "DESC"]],
     });
@@ -436,10 +612,7 @@ const listPublicQueues = async (req, res) => {
         await ensureJoinCode(queue);
         const stats = await getQueueStats(queue.id);
 
-        return {
-          ...queue.toJSON(),
-          stats,
-        };
+        return serializePublicQueue(queue, stats);
       }),
     );
 
@@ -486,6 +659,12 @@ const getPublicQueue = async (req, res) => {
           as: "church",
           attributes: ["id", "name"],
         },
+        {
+          model: Campaign,
+          as: "campaign",
+          attributes: ["title"],
+          required: false,
+        },
       ],
     });
 
@@ -500,7 +679,7 @@ const getPublicQueue = async (req, res) => {
     const stats = await getQueueStats(queue.id);
 
     return res.status(200).json({
-      queue,
+      queue: serializePublicQueue(queue, stats),
       stats,
     });
   } catch (error) {
@@ -544,12 +723,70 @@ const updateQueue = async (req, res) => {
     const {
       name,
       description,
-      prefix,
       status,
       estimatedServiceTime,
-      maxCustomers,
       allowWalkIns,
+      serviceType,
+      campaignId,
     } = req.body;
+
+    if (
+      serviceType !== undefined &&
+      !["GENERAL", "PLEDGE_CAMPAIGN"].includes(serviceType)
+    ) {
+      return res.status(400).json({
+        message: "Service type must be GENERAL or PLEDGE_CAMPAIGN",
+      });
+    }
+
+    const nextServiceType = serviceType ?? queue.serviceType ?? "GENERAL";
+    const nextCampaignId =
+      nextServiceType === "PLEDGE_CAMPAIGN"
+        ? campaignId !== undefined
+          ? campaignId || null
+          : queue.campaignId
+        : null;
+    const serviceChanged =
+      nextServiceType !== (queue.serviceType || "GENERAL") ||
+      nextCampaignId !== (queue.campaignId || null);
+
+    if (serviceChanged) {
+      const activeEntries = await QueueEntry.count({
+        where: {
+          queueId,
+          status: { [Op.in]: ["waiting", "standby", "called", "serving"] },
+        },
+      });
+      if (activeEntries > 0) {
+        return res.status(409).json({
+          message:
+            "Service type or campaign cannot change while members are in this queue",
+        });
+      }
+    }
+
+    let linkedCampaign = null;
+    if (nextServiceType === "PLEDGE_CAMPAIGN") {
+      if (!nextCampaignId) {
+        return res.status(400).json({
+          message: "A pledge campaign is required for this service type",
+        });
+      }
+      if (serviceChanged) {
+        linkedCampaign = await getActiveCampaign(nextCampaignId, churchId);
+        if (!linkedCampaign) {
+          const existingCampaign = await getQueueCampaign(
+            nextCampaignId,
+            churchId,
+          );
+          return res.status(existingCampaign ? 400 : 404).json({
+            message: existingCampaign
+              ? "The selected campaign is not active"
+              : "The selected campaign was not found for this church",
+          });
+        }
+      }
+    }
 
     /**
      * Name
@@ -580,24 +817,9 @@ const updateQueue = async (req, res) => {
       }
 
       queue.name = newName;
+      queue.prefix = generateQueuePrefix(newName);
 
       queue.slug = await generateUniqueSlug(churchId, newName, queueId);
-    }
-
-    /**
-     * Prefix
-     */
-    if (prefix !== undefined) {
-      const newPrefix = prefix.trim().toUpperCase();
-
-      if (!validateQueuePrefix(newPrefix)) {
-        return res.status(400).json({
-          message:
-            "Queue prefix must contain only letters or numbers and be between 1 and 5 characters",
-        });
-      }
-
-      queue.prefix = newPrefix;
     }
 
     /**
@@ -635,24 +857,7 @@ const updateQueue = async (req, res) => {
       queue.estimatedServiceTime = value;
     }
 
-    /**
-     * Maximum customers
-     */
-    if (maxCustomers !== undefined) {
-      if (maxCustomers === null || maxCustomers === "") {
-        queue.maxCustomers = null;
-      } else {
-        const value = Number(maxCustomers);
-
-        if (!Number.isInteger(value) || value <= 0) {
-          return res.status(400).json({
-            message: "Maximum customers must be a positive number",
-          });
-        }
-
-        queue.maxCustomers = value;
-      }
-    }
+    queue.maxCustomers = null;
 
     /**
      * Walk-ins
@@ -661,12 +866,23 @@ const updateQueue = async (req, res) => {
       queue.allowWalkIns = Boolean(allowWalkIns);
     }
 
+    queue.serviceType = nextServiceType;
+    queue.campaignId = nextCampaignId;
+
     await queue.save();
+
+    if (nextCampaignId) {
+      const campaignForResponse =
+        linkedCampaign || (await getQueueCampaign(nextCampaignId, churchId));
+      queue.setDataValue("campaign", campaignForResponse);
+    } else {
+      queue.setDataValue("campaign", null);
+    }
 
     /**
      * Socket
      */
-    emitQueueEvent(queue.id, "queue:updated", queue);
+    emitQueueEvent(queue.id, "queue:updated", serializePublicQueue(queue));
 
     emitChurchEvent(churchId, "queue:updated", queue);
 
@@ -695,7 +911,7 @@ const updateQueue = async (req, res) => {
 
     return res.status(200).json({
       message: "Queue updated successfully",
-      queue,
+      queue: serializeQueue(queue),
     });
   } catch (error) {
     console.error("Update queue error:", error);
@@ -790,13 +1006,55 @@ const deleteQueue = async (req, res) => {
       message: "Queue deleted successfully",
     });
   } catch (error) {
-    await transaction.rollback();
+    if (!transaction.finished) await transaction.rollback();
 
     console.error("Delete queue error:", error);
 
     return res.status(500).json({
       message: "Server error",
     });
+  }
+};
+
+const getCurrentQueueService = async (req, res) => {
+  try {
+    const { queueId } = req.params;
+    const churchId = req.user.churchId;
+    const queue = await Queue.findOne({ where: { id: queueId, churchId } });
+    if (!queue) return res.status(404).json({ message: "Queue not found" });
+    if (!(await getQueueStaffAssignment(queueId, req.user.id))) {
+      return res
+        .status(403)
+        .json({ message: "You are not assigned to this queue" });
+    }
+    const entry = await QueueEntry.findOne({
+      where: {
+        queueId,
+        calledBy: req.user.id,
+        status: { [Op.in]: ["called", "serving"] },
+      },
+      order: [["calledAt", "DESC"]],
+    });
+    if (!entry) return res.json({ entry: null, service: null });
+    return res.json({
+      entry: {
+        id: entry.id,
+        queueId,
+        customerName: entry.customerName,
+        customerPhone: entry.customerPhone,
+        queueNumber: entry.queueNumber,
+        ticketNumber: formatTicketNumber(queue.prefix, entry.queueNumber),
+        status: entry.status,
+      },
+      ...(queue.serviceType === "PLEDGE_CAMPAIGN"
+        ? { service: await getQueueService(queue, entry) }
+        : { service: null }),
+    });
+  } catch (error) {
+    console.error("Get current queue service error:", error);
+    return res
+      .status(500)
+      .json({ message: "Unable to refresh current service" });
   }
 };
 
@@ -899,30 +1157,6 @@ const joinQueue = async (req, res) => {
     }
 
     /**
-     * Capacity
-     */
-    if (queue.maxCustomers) {
-      const activeCount = await QueueEntry.count({
-        where: {
-          churchId: queue.churchId,
-          queueId,
-          status: {
-            [Op.in]: ["waiting", "called", "serving"],
-          },
-        },
-        transaction,
-      });
-
-      if (activeCount >= queue.maxCustomers) {
-        await transaction.rollback();
-
-        return res.status(409).json({
-          message: "Queue is currently full",
-        });
-      }
-    }
-
-    /**
      * Get next ticket number.
      *
      * Because this queue row is locked,
@@ -984,10 +1218,7 @@ const joinQueue = async (req, res) => {
     /**
      * Queue dashboard
      */
-    emitQueueEvent(queue.id, "queue:customerJoined", {
-      queueId: queue.id,
-      entry: response,
-    });
+    emitQueueEvent(queue.id, "queue:customerJoined", { queueId: queue.id });
 
     /**
      * Church dashboard
@@ -1145,19 +1376,6 @@ const rejoinQueue = async (req, res) => {
       return res.status(400).json({ message: "Queue is not currently open" });
     }
 
-    if (queue.maxCustomers) {
-      const activeCount = await QueueEntry.count({
-        where: {
-          queueId: entry.queueId,
-          status: { [Op.in]: ["waiting", "called", "serving"] },
-        },
-      });
-
-      if (activeCount >= queue.maxCustomers) {
-        return res.status(409).json({ message: "Queue is currently full" });
-      }
-    }
-
     entry.status = "waiting";
     entry.calledBy = null;
     entry.calledAt = null;
@@ -1171,7 +1389,9 @@ const rejoinQueue = async (req, res) => {
       ticketNumber: formatTicketNumber(queue.prefix, entry.queueNumber),
     };
 
-    emitQueueEvent(entry.queueId, "queue:customerRejoined", response);
+    emitQueueEvent(entry.queueId, "queue:customerRejoined", {
+      queueId: entry.queueId,
+    });
     emitChurchEvent(entry.churchId, "church:queueUpdated", response);
     emitCustomerEvent(customerToken, "customer:rejoined", response);
 
@@ -1209,6 +1429,7 @@ const callNext = async (req, res) => {
       },
       transaction,
       lock: transaction.LOCK.UPDATE,
+      include: [queueCampaignInclude],
     });
 
     if (!queue) {
@@ -1236,24 +1457,27 @@ const callNext = async (req, res) => {
       "super-admin",
       "superadmin",
     ].includes(req.user.role?.name);
-    const assignment = canOperateAnyQueue
-      ? true
-      : await QueueStaff.findOne({
-          where: {
-            churchId,
-            queueId,
-            userId: staffId,
-            status: "active",
-          },
-          transaction,
-          lock: transaction.LOCK.UPDATE,
-        });
+    const assignment =
+      canOperateAnyQueue && queue.serviceType !== "PLEDGE_CAMPAIGN"
+        ? true
+        : await getQueueStaffAssignment(queueId, staffId);
 
     if (!assignment) {
       await transaction.rollback();
 
       return res.status(403).json({
         message: "You are not assigned to this queue",
+      });
+    }
+
+    if (
+      queue.serviceType === "PLEDGE_CAMPAIGN" &&
+      callRequest.kind === "batch" &&
+      callRequest.queueNumbers.length > 1
+    ) {
+      await transaction.rollback();
+      return res.status(400).json({
+        message: "Pledge campaign queues must call one member at a time",
       });
     }
 
@@ -1387,6 +1611,11 @@ const callNext = async (req, res) => {
       staffId,
     };
 
+    const callService =
+      queue.serviceType === "PLEDGE_CAMPAIGN"
+        ? await getQueueService(queue, primaryEntry)
+        : null;
+
     for (const entry of updatedEntries) {
       const entryTicketNumber = formatTicketNumber(
         queue.prefix,
@@ -1408,7 +1637,10 @@ const callNext = async (req, res) => {
         staffId,
       };
 
-      emitQueueEvent(queueId, "queue:customerServing", entryResponse);
+      emitQueueEvent(queueId, "queue:customerServing", {
+        queueId,
+        status: "updated",
+      });
       emitChurchEvent(churchId, "church:queueUpdated", entryResponse);
       emitCustomerEvent(entry.customerToken, "customer:serving", {
         queueId,
@@ -1446,6 +1678,16 @@ const callNext = async (req, res) => {
             ? "Current customer completed and next customer is now serving"
             : "Customer is now serving",
       entry: response,
+      ...(callService
+        ? {
+            queueEntry: {
+              id: primaryEntry.id,
+              name: primaryEntry.customerName,
+              phone: primaryEntry.customerPhone,
+            },
+            service: callService,
+          }
+        : {}),
       entries: updatedEntries.map((entry) => ({
         ...response,
         id: entry.id,
@@ -1461,13 +1703,228 @@ const callNext = async (req, res) => {
       completedEntryId: activeService?.id ?? null,
     });
   } catch (error) {
-    await transaction.rollback();
+    if (!transaction.finished) await transaction.rollback();
 
     console.error("Call next customer error:", error);
 
     return res.status(500).json({
       message: "Server error",
     });
+  }
+};
+
+const getQueuePledges = async (req, res) => {
+  try {
+    const { queueId } = req.params;
+    const churchId = req.user.churchId;
+    const queue = await Queue.findOne({ where: { id: queueId, churchId } });
+    if (!queue) return res.status(404).json({ message: "Queue not found" });
+    if (!(await getQueueStaffAssignment(queueId, req.user.id))) {
+      return res
+        .status(403)
+        .json({ message: "You are not assigned to this queue" });
+    }
+    if (queue.serviceType !== "PLEDGE_CAMPAIGN" || !queue.campaignId) {
+      return res
+        .status(409)
+        .json({ message: "No pledge campaign is linked to this queue" });
+    }
+
+    const campaign = await getQueueCampaign(queue.campaignId, churchId);
+    if (!campaign)
+      return res.status(404).json({ message: "Linked campaign was not found" });
+    const query = String(req.query.q || "").trim();
+    if (query.length < 3)
+      return res
+        .status(400)
+        .json({ message: "Search must be at least 3 characters" });
+
+    const digits = normalizePhone(query);
+    const pledges = await Pledge.findAll({
+      where: {
+        campaignId: queue.campaignId,
+        [Op.or]: [
+          { name: { [Op.like]: `%${query}%` } },
+          { phone: { [Op.like]: `%${digits || query}%` } },
+        ],
+      },
+      attributes: [
+        "id",
+        "name",
+        "phone",
+        "monetaryAmount",
+        "fulfilledMonetaryAmount",
+        "status",
+      ],
+      include: [
+        {
+          model: db.pledgeItems,
+          as: "items",
+          attributes: ["id", "campaignItemId", "quantity", "fulfilledQuantity"],
+          include: [
+            {
+              model: db.pledgeCampaignItems,
+              as: "campaignItem",
+              attributes: ["name", "unit"],
+            },
+          ],
+        },
+      ],
+      limit: 20,
+      order: [["createdAt", "DESC"]],
+    });
+    return res.json({ pledges: pledges.map(serializeQueuePledge) });
+  } catch (error) {
+    console.error("Queue pledge search error:", error);
+    return res
+      .status(500)
+      .json({ message: "Unable to search campaign pledges" });
+  }
+};
+
+const serializeQueuePledge = (pledge) => ({
+  ...(() => {
+    const remaining = getPledgeRemaining(pledge);
+    return {
+      id: pledge.id,
+      name: pledge.name,
+      phone: pledge.phone,
+      monetaryAmount: pledge.monetaryAmount,
+      fulfilledMonetaryAmount: pledge.fulfilledMonetaryAmount,
+      remainingMonetaryAmount: remaining.monetaryRemaining,
+      status: pledge.status,
+      items: (pledge.items || []).map((item) => ({
+        id: item.id,
+        campaignItemId: item.campaignItemId,
+        name: item.campaignItem?.name || "Material item",
+        unit: item.campaignItem?.unit || "",
+        quantity: item.quantity,
+        fulfilledQuantity: item.fulfilledQuantity,
+        remainingQuantity:
+          remaining.items.find((entry) => entry.pledgeItemId === item.id)
+            ?.remainingQuantity || "0.000",
+      })),
+    };
+  })(),
+});
+
+const createQueuePledge = async (req, res) => {
+  let scopedCampaignId = null;
+  try {
+    const { queueId } = req.params;
+    const churchId = req.user.churchId;
+    const queue = await Queue.findOne({ where: { id: queueId, churchId } });
+    if (!queue) return res.status(404).json({ message: "Queue not found" });
+    if (!(await getQueueStaffAssignment(queueId, req.user.id))) {
+      return res
+        .status(403)
+        .json({ message: "You are not assigned to this queue" });
+    }
+    if (queue.serviceType !== "PLEDGE_CAMPAIGN" || !queue.campaignId) {
+      return res
+        .status(409)
+        .json({ message: "No pledge campaign is linked to this queue" });
+    }
+    const campaign = await getQueueCampaign(queue.campaignId, churchId);
+    if (!campaign)
+      return res.status(404).json({ message: "Linked campaign was not found" });
+    if (campaign.status !== "ACTIVE") {
+      return res
+        .status(409)
+        .json({ message: "This campaign is not accepting new pledges" });
+    }
+    scopedCampaignId = campaign.id;
+
+    const { name, phone, idempotencyKey } = req.body;
+    if (
+      typeof name !== "string" ||
+      name.trim().length < 2 ||
+      typeof phone !== "string" ||
+      !phone.trim()
+    ) {
+      return res
+        .status(400)
+        .json({ message: "Member name and phone are required" });
+    }
+    if (
+      !idempotencyKey ||
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+        idempotencyKey,
+      )
+    ) {
+      return res
+        .status(400)
+        .json({ message: "A valid idempotencyKey UUID is required" });
+    }
+
+    let creationStatus = 500;
+    let creationBody;
+    const creationResponse = {
+      status(code) {
+        creationStatus = code;
+        return this;
+      },
+      json(body) {
+        creationBody = body;
+        return body;
+      },
+    };
+    await createPublicPledge(
+      {
+        params: { slugOrCode: campaign.slug },
+        body: req.body,
+        get: (header) =>
+          header.toLowerCase() === "idempotency-key"
+            ? idempotencyKey
+            : req.get(header),
+      },
+      creationResponse,
+    );
+    if (creationStatus >= 400)
+      return res.status(creationStatus).json(creationBody);
+
+    const pledge = await Pledge.findOne({
+      where: { campaignId: campaign.id, idempotencyKey },
+      include: [
+        {
+          model: db.pledgeItems,
+          as: "items",
+          include: [
+            {
+              model: db.pledgeCampaignItems,
+              as: "campaignItem",
+              attributes: ["name", "unit"],
+            },
+          ],
+        },
+      ],
+    });
+    if (!pledge)
+      return res
+        .status(500)
+        .json({ message: "Created pledge could not be loaded" });
+    return res.status(creationStatus).json({
+      ...creationBody,
+      pledge: serializeQueuePledge(pledge),
+      duplicate: creationStatus === 200,
+    });
+  } catch (error) {
+    if (error.status)
+      return res.status(error.status).json({ message: error.message });
+    if (error.name === "SequelizeUniqueConstraintError") {
+      const existing = await Pledge.findOne({
+        where: {
+          campaignId: scopedCampaignId,
+          idempotencyKey: req.body?.idempotencyKey,
+        },
+      });
+      if (existing)
+        return res
+          .status(200)
+          .json({ pledge: serializeQueuePledge(existing), duplicate: true });
+    }
+    console.error("Queue pledge create error:", error);
+    return res.status(500).json({ message: "Unable to create pledge" });
   }
 };
 
@@ -1547,7 +2004,10 @@ const startServing = async (req, res) => {
       staffId,
     };
 
-    emitQueueEvent(queueId, "queue:customerServing", response);
+    emitQueueEvent(queueId, "queue:customerServing", {
+      queueId,
+      status: "updated",
+    });
 
     emitCustomerEvent(entry.customerToken, "customer:serving", response);
 
@@ -1871,23 +2331,6 @@ const transferCustomer = async (req, res) => {
         .json({ message: "The destination queue is not open" });
     }
 
-    if (targetQueue.maxCustomers) {
-      const activeCount = await QueueEntry.count({
-        where: {
-          queueId: targetQueue.id,
-          status: { [Op.in]: ["waiting", "called", "serving"] },
-        },
-        transaction,
-      });
-
-      if (activeCount >= targetQueue.maxCustomers) {
-        await transaction.rollback();
-        return res
-          .status(409)
-          .json({ message: "The destination queue is full" });
-      }
-    }
-
     const entry = await QueueEntry.findOne({
       where: { id: entryId, queueId },
       transaction,
@@ -1943,10 +2386,12 @@ const transferCustomer = async (req, res) => {
       entryType: entry.entryType,
     };
 
-    emitQueueEvent(sourceQueue.id, "queue:customerTransferred", response);
+    emitQueueEvent(sourceQueue.id, "queue:customerTransferred", {
+      queueId: sourceQueue.id,
+      targetQueueId: targetQueue.id,
+    });
     emitQueueEvent(targetQueue.id, "queue:customerJoined", {
       queueId: targetQueue.id,
-      entry: response,
     });
     emitChurchEvent(churchId, "church:queueUpdated", response);
     emitCustomerEvent(entry.customerToken, "customer:transferred", response);
@@ -2124,7 +2569,10 @@ const assignStaff = async (req, res) => {
       existing.churchId = churchId;
       await existing.save();
 
-      emitQueueEvent(queueId, "queue:staffAssigned", existing);
+      emitChurchEvent(churchId, "church:queueStaffUpdated", {
+        queueId,
+        action: "updated",
+      });
       emitChurchEvent(churchId, "church:queueStaffUpdated", {
         queueId,
         userId,
@@ -2146,7 +2594,10 @@ const assignStaff = async (req, res) => {
       assignedAt: new Date(),
     });
 
-    emitQueueEvent(queueId, "queue:staffAssigned", assignment);
+    emitChurchEvent(churchId, "church:queueStaffUpdated", {
+      queueId,
+      action: "assigned",
+    });
     emitChurchEvent(churchId, "church:queueStaffUpdated", {
       queueId,
       userId,
@@ -2223,11 +2674,6 @@ const removeStaff = async (req, res) => {
 
     await assignment.save();
 
-    emitQueueEvent(queueId, "queue:staffRemoved", {
-      queueId,
-      userId,
-    });
-
     emitChurchEvent(churchId, "church:queueStaffUpdated", {
       queueId,
       userId,
@@ -2266,6 +2712,9 @@ module.exports = {
   leaveQueue,
 
   getWaitingCustomers,
+  getQueuePledges,
+  createQueuePledge,
+  getCurrentQueueService,
 
   callNext,
   startServing,

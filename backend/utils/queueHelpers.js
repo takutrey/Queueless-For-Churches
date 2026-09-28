@@ -5,6 +5,7 @@ const Queue = db.queues;
 const Church = db.churches;
 const User = db.users;
 const QueueStaff = db.queueStaff;
+const Campaign = db.pledgeCampaigns;
 
 const JOIN_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 
@@ -125,6 +126,29 @@ const getActiveChurch = async (churchId) => {
   });
 };
 
+const getActiveCampaign = async (campaignId, churchId) => {
+  if (!campaignId || !churchId) return null;
+
+  return Campaign.findOne({
+    where: { id: campaignId, churchId, status: "ACTIVE" },
+    include: [
+      {
+        model: Church,
+        as: "church",
+        attributes: ["id"],
+        include: [
+          {
+            model: db.churchSettings,
+            as: "churchSettings",
+            attributes: ["currency"],
+            required: false,
+          },
+        ],
+      },
+    ],
+  });
+};
+
 /**
  * Find a queue belonging to a church
  */
@@ -134,6 +158,28 @@ const getChurchQueue = async (queueId, churchId) => {
       id: queueId,
       churchId,
     },
+  });
+};
+
+const getQueueCampaign = async (campaignId, churchId) => {
+  if (!campaignId || !churchId) return null;
+  return Campaign.findOne({
+    where: { id: campaignId, churchId },
+    include: [
+      {
+        model: Church,
+        as: "church",
+        attributes: ["id"],
+        include: [
+          {
+            model: db.churchSettings,
+            as: "churchSettings",
+            attributes: ["currency"],
+            required: false,
+          },
+        ],
+      },
+    ],
   });
 };
 
@@ -242,12 +288,14 @@ module.exports = {
   generateJoinCode,
   validateQueuePrefix,
   formatTicketNumber,
-  getActiveChurch,
   getQueueStaffAssignment,
   getChurchQueue,
+  getQueueCampaign,
   getChurchUser,
+  getActiveCampaign,
   emitQueueEvent,
   getQueueRoom,
   getChurchRoom,
   getQueueStats,
+  getActiveChurch,
 };

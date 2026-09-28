@@ -17,6 +17,9 @@ const {
   leaveQueue,
 
   getWaitingCustomers,
+  getQueuePledges,
+  createQueuePledge,
+  getCurrentQueueService,
 
   callNext,
   startServing,
@@ -147,6 +150,10 @@ router.delete("/:queueId", authenticate, deleteQueue);
  * GET /api/queues/:queueId/customers
  */
 router.get("/:queueId/customers", authenticate, getWaitingCustomers);
+
+router.get("/:queueId/pledges/search", authenticate, getQueuePledges);
+router.post("/:queueId/pledges", authenticate, createQueuePledge);
+router.get("/:queueId/current-service", authenticate, getCurrentQueueService);
 
 /**
  * Call next

@@ -91,6 +91,10 @@ module.exports = (sequelize, DataTypes) => {
       foreignKey: "campaignId",
       as: "items",
     });
+    PledgeCampaign.hasMany(models.queues, {
+      foreignKey: "campaignId",
+      as: "queues",
+    });
   };
 
   return PledgeCampaign;

@@ -72,13 +72,6 @@ const createNotification = async ({
       }
 
       /**
-       * Queue
-       */
-      if (queueId) {
-        io.to(`queue:${queueId}`).emit("notification:new", payload);
-      }
-
-      /**
        * Church
        */
       if (resolvedChurchId) {
@@ -126,6 +119,14 @@ const emitChurchEvent = (churchId, event, data) => {
   }
 };
 
+const emitPublicEvent = (event, data) => {
+  try {
+    getIO().emit(event, data);
+  } catch (error) {
+    console.error("Public socket event error:", error.message);
+  }
+};
+
 /**
  * ==========================================
  * CUSTOMER EVENT
@@ -160,6 +161,7 @@ module.exports = {
   createNotification,
   emitQueueEvent,
   emitChurchEvent,
+  emitPublicEvent,
   emitCustomerEvent,
   emitUserEvent,
 };

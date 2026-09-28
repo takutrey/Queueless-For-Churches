@@ -43,6 +43,17 @@ module.exports = (sequelize, DataTypes) => {
         allowNull: true,
       },
 
+      serviceType: {
+        type: DataTypes.ENUM("GENERAL", "PLEDGE_CAMPAIGN"),
+        allowNull: false,
+        defaultValue: "GENERAL",
+      },
+
+      campaignId: {
+        type: DataTypes.UUID,
+        allowNull: true,
+      },
+
       status: {
         type: DataTypes.ENUM("open", "paused", "closed"),
         allowNull: false,
@@ -99,6 +110,11 @@ module.exports = (sequelize, DataTypes) => {
     Queue.belongsTo(models.churches, {
       foreignKey: "churchId",
       as: "church",
+    });
+
+    Queue.belongsTo(models.pledgeCampaigns, {
+      foreignKey: "campaignId",
+      as: "campaign",
     });
 
     Queue.hasMany(models.queueEntries, {

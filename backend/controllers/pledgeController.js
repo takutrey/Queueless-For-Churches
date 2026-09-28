@@ -10,6 +10,7 @@ const {
   parseQuantity,
   toSlug,
   generateCampaignJoinCode,
+  getPledgeRemaining,
 } = require("../utils/pledgeHelpers");
 const { getIO } = require("../config/socket");
 
@@ -144,11 +145,19 @@ const emitDashboardPledge = (pledge, totals, items = []) => {
     },
     totals,
   };
-  emitCampaignState(totals.campaignId, "pledge-created", payload);
-  emitCampaignState(totals.campaignId, "pledge-created", {
-    ...payload,
-    materialRequirements: totals.itemTotals || [],
-  });
+  try {
+    const io = getIO();
+    io.to(`campaign-admin:${totals.campaignId}`).emit(
+      "pledge-created",
+      payload,
+    );
+    io.to(`campaign-admin:${totals.campaignId}`).emit("pledge-created", {
+      ...payload,
+      materialRequirements: totals.itemTotals || [],
+    });
+  } catch (error) {
+    console.error("Campaign admin pledge socket error:", error.message);
+  }
 };
 
 const requestHashFor = (campaignId, name, phone, amount) =>
@@ -255,6 +264,22 @@ const createCampaign = async (req, res) => {
       joinCode: await createUniqueCampaignJoinCode(),
     });
     const totals = await calculateCampaignTotals(campaign.id);
+    try {
+      const io = getIO();
+      io.to(`church:${churchId}`).emit("campaign:created", {
+        campaignId: campaign.id,
+        campaign,
+        totals,
+      });
+      if (["ACTIVE", "PAUSED", "COMPLETED"].includes(campaign.status)) {
+        io.emit("public:campaignCreated", {
+          campaign: publicCampaign(campaign, totals),
+          totals,
+        });
+      }
+    } catch (error) {
+      console.error("Campaign creation socket error:", error.message);
+    }
     emitCampaignState(campaign.id, "campaign:created", {
       campaignId: campaign.id,
       campaign,
@@ -417,6 +442,286 @@ const getPublicCampaign = async (req, res) => {
   } catch (error) {
     console.error("Get public campaign error:", error);
     return res.status(500).json({ message: "Unable to load campaign" });
+  }
+};
+
+const getPublicPledgeReceipt = async (req, res) => {
+  try {
+    const lookup = String(req.params.slugOrCode || "").trim();
+    const receiptKey = String(req.get("X-Pledge-Receipt-Key") || "").trim();
+    if (!lookup || receiptKey.length < 24 || receiptKey.length > 128) {
+      return res
+        .status(400)
+        .json({ message: "A valid pledge receipt key is required" });
+    }
+
+    const campaign = await Campaign.findOne({
+      where: {
+        [Op.or]: [
+          { id: lookup },
+          { slug: lookup },
+          { joinCode: lookup.toUpperCase() },
+        ],
+      },
+      include: [
+        {
+          model: Church,
+          as: "church",
+          where: { status: "active" },
+          attributes: ["id"],
+          required: true,
+        },
+      ],
+    });
+    if (!campaign)
+      return res.status(404).json({ message: "Pledge receipt not found" });
+
+    const pledge = await Pledge.findOne({
+      where: { campaignId: campaign.id, idempotencyKey: receiptKey },
+      attributes: [
+        "id",
+        "name",
+        "monetaryAmount",
+        "fulfilledMonetaryAmount",
+        "status",
+        "createdAt",
+      ],
+      include: [
+        {
+          model: db.pledgeItems,
+          as: "items",
+          attributes: ["id", "campaignItemId", "quantity", "fulfilledQuantity"],
+          include: [
+            {
+              model: db.pledgeCampaignItems,
+              as: "campaignItem",
+              attributes: ["name", "unit"],
+            },
+          ],
+        },
+      ],
+    });
+    if (!pledge)
+      return res.status(404).json({ message: "Pledge receipt not found" });
+
+    const remaining = getPledgeRemaining(pledge);
+    return res.json({
+      campaign: { id: campaign.id, title: campaign.title },
+      pledge: {
+        id: pledge.id,
+        name: pledge.name,
+        monetaryAmount: pledge.monetaryAmount,
+        fulfilledMonetaryAmount: pledge.fulfilledMonetaryAmount,
+        remainingMonetaryAmount: remaining.monetaryRemaining,
+        status: pledge.status,
+        createdAt: pledge.createdAt,
+        items: (pledge.items || []).map((item) => ({
+          id: item.id,
+          name: item.campaignItem?.name || "Material item",
+          unit: item.campaignItem?.unit || "",
+          quantity: item.quantity,
+          fulfilledQuantity: item.fulfilledQuantity,
+          remainingQuantity:
+            remaining.items.find((value) => value.pledgeItemId === item.id)
+              ?.remainingQuantity || "0.000",
+        })),
+      },
+    });
+  } catch (error) {
+    console.error("Get public pledge receipt error:", error);
+    return res.status(500).json({ message: "Unable to load pledge receipt" });
+  }
+};
+
+const decimalUnits = (value, scale) => {
+  const [whole, fraction = ""] = String(value || "0").split(".");
+  return (
+    BigInt(whole || "0") * 10n ** BigInt(scale) +
+    BigInt(fraction.padEnd(scale, "0").slice(0, scale) || "0")
+  );
+};
+
+const unitsDecimal = (value, scale) => {
+  const factor = 10n ** BigInt(scale);
+  return `${value / factor}.${String(value % factor).padStart(scale, "0")}`;
+};
+
+const fulfillPledge = async (req, res) => {
+  try {
+    const { pledgeId } = req.params;
+    const amountInput = req.body.monetaryAmount ?? req.body.amount;
+    const amountText =
+      amountInput === undefined || amountInput === null
+        ? ""
+        : String(amountInput).trim();
+    const parsedAmount =
+      /^\d+(\.\d{1,2})?$/.test(amountText) && Number(amountText) > 0
+        ? (() => {
+            const [whole, fraction = ""] = amountText.split(".");
+            return `${whole}.${fraction.padEnd(2, "0")}`;
+          })()
+        : null;
+    if (
+      amountInput !== undefined &&
+      amountInput !== null &&
+      amountInput !== "" &&
+      !parsedAmount
+    ) {
+      return res
+        .status(400)
+        .json({ message: "Fulfillment amount must be positive" });
+    }
+    const itemFulfillments = Array.isArray(req.body.items)
+      ? req.body.items
+      : [];
+    const parsedItems = itemFulfillments.map((item) => {
+      const quantityText = String(item.quantity ?? "").trim();
+      const quantity =
+        /^\d+(\.\d{1,3})?$/.test(quantityText) && Number(quantityText) > 0
+          ? (() => {
+              const [whole, fraction = ""] = quantityText.split(".");
+              return `${whole}.${fraction.padEnd(3, "0")}`;
+            })()
+          : null;
+      return {
+        pledgeItemId: item.pledgeItemId || item.id,
+        quantity,
+      };
+    });
+    if (parsedItems.some((item) => !item.pledgeItemId || !item.quantity)) {
+      return res.status(400).json({
+        message:
+          "Each item fulfillment requires a pledge item and positive quantity",
+      });
+    }
+    if (!parsedAmount && !parsedItems.length) {
+      return res
+        .status(400)
+        .json({ message: "Enter a monetary amount or item quantity" });
+    }
+
+    const updated = await db.sequelize.transaction(async (transaction) => {
+      const pledge = await Pledge.findByPk(pledgeId, {
+        transaction,
+        lock: transaction.LOCK.UPDATE,
+        include: [
+          {
+            model: db.pledgeItems,
+            as: "items",
+            include: [
+              {
+                model: db.pledgeCampaignItems,
+                as: "campaignItem",
+                attributes: ["id", "name", "unit"],
+              },
+            ],
+          },
+        ],
+      });
+      if (!pledge) {
+        const error = new Error("Pledge not found");
+        error.status = 404;
+        throw error;
+      }
+      const campaign = await Campaign.findOne({
+        where: { id: pledge.campaignId, churchId: req.user.churchId },
+        transaction,
+      });
+      if (!campaign) {
+        const error = new Error("Pledge not found");
+        error.status = 404;
+        throw error;
+      }
+      if (pledge.status === "CANCELLED") {
+        const error = new Error("A cancelled pledge cannot be fulfilled");
+        error.status = 409;
+        throw error;
+      }
+
+      if (parsedAmount) {
+        if (!pledge.monetaryAmount) {
+          const error = new Error("This pledge has no monetary amount");
+          error.status = 400;
+          throw error;
+        }
+        const next =
+          decimalUnits(pledge.fulfilledMonetaryAmount, 2) +
+          decimalUnits(parsedAmount, 2);
+        if (next > decimalUnits(pledge.monetaryAmount, 2)) {
+          const error = new Error(
+            "Fulfillment exceeds the pledged monetary amount",
+          );
+          error.status = 400;
+          throw error;
+        }
+        pledge.fulfilledMonetaryAmount = unitsDecimal(next, 2);
+      }
+
+      const itemById = new Map(pledge.items.map((item) => [item.id, item]));
+      for (const fulfillment of parsedItems) {
+        const item = itemById.get(fulfillment.pledgeItemId);
+        if (!item) {
+          const error = new Error("Pledge item not found");
+          error.status = 404;
+          throw error;
+        }
+        const next =
+          decimalUnits(item.fulfilledQuantity, 3) +
+          decimalUnits(fulfillment.quantity, 3);
+        if (next > decimalUnits(item.quantity, 3)) {
+          const error = new Error(
+            `Fulfillment exceeds pledged quantity for ${item.campaignItem?.name || "item"}`,
+          );
+          error.status = 400;
+          throw error;
+        }
+        item.fulfilledQuantity = unitsDecimal(next, 3);
+        await item.save({ transaction });
+      }
+
+      pledge.status = derivePledgeStatus({
+        monetaryAmount: pledge.monetaryAmount,
+        fulfilledMonetaryAmount: pledge.fulfilledMonetaryAmount,
+        items: pledge.items,
+      });
+      await pledge.save({ transaction });
+      return Pledge.findByPk(pledge.id, {
+        transaction,
+        include: [
+          {
+            model: db.pledgeItems,
+            as: "items",
+            include: [
+              {
+                model: db.pledgeCampaignItems,
+                as: "campaignItem",
+                attributes: ["id", "name", "unit"],
+              },
+            ],
+          },
+        ],
+      });
+    });
+
+    const totals = await calculateCampaignTotals(updated.campaignId);
+    const campaignItems = await db.pledgeCampaignItems.findAll({
+      where: { campaignId: updated.campaignId },
+      attributes: ["id"],
+    });
+    const itemTotals = await Promise.all(
+      campaignItems.map((item) => calculateCampaignItemTotals(item.id)),
+    );
+    const freshTotals = { ...totals, itemTotals };
+    emitTotals(freshTotals);
+    emitDashboardPledge(updated, freshTotals, updated.items);
+    return res.json({ pledge: updated, totals: freshTotals });
+  } catch (error) {
+    if (error.status)
+      return res.status(error.status).json({ message: error.message });
+    console.error("Fulfill pledge error:", error);
+    return res
+      .status(500)
+      .json({ message: "Unable to record pledge fulfillment" });
   }
 };
 
@@ -728,14 +1033,40 @@ const listChurchPledges = async (req, res) => {
           where: campaignWhere,
           attributes: ["id", "title", "slug"],
         },
+        {
+          model: db.pledgeItems,
+          as: "items",
+          include: [
+            {
+              model: db.pledgeCampaignItems,
+              as: "campaignItem",
+              attributes: ["id", "name", "unit"],
+            },
+          ],
+        },
       ],
       order: [["createdAt", "DESC"]],
       limit,
       offset: (page - 1) * limit,
       attributes: { exclude: ["idempotencyKey"] },
+      distinct: true,
     });
     return res.json({
-      pledges: rows,
+      pledges: rows.map((pledge) => {
+        const remaining = getPledgeRemaining(pledge);
+        return {
+          ...pledge.toJSON(),
+          remainingMonetaryAmount: remaining.monetaryRemaining,
+          items: (pledge.items || []).map((item) => ({
+            ...item.toJSON(),
+            name: item.campaignItem?.name || "Material item",
+            unit: item.campaignItem?.unit || "",
+            remainingQuantity:
+              remaining.items.find((value) => value.pledgeItemId === item.id)
+                ?.remainingQuantity || "0.000",
+          })),
+        };
+      }),
       count,
       page,
       limit,
@@ -963,7 +1294,9 @@ module.exports = {
   updateCampaign,
   getCampaign,
   getPublicCampaign,
+  getPublicPledgeReceipt,
   createPublicPledge,
+  fulfillPledge,
   listChurchPledges,
   listPledges,
   listCampaignItems,

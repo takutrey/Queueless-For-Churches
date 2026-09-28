@@ -7,6 +7,11 @@ const router = express.Router();
 const authenticate = passport.authenticate("jwt", { session: false });
 
 router.get("/public/:slugOrCode", controller.getPublicCampaign);
+router.get(
+  "/public/:slugOrCode/pledges/receipt",
+  pledgeRateLimit,
+  controller.getPublicPledgeReceipt,
+);
 router.get("/public", controller.listPublicCampaigns);
 router.post(
   "/public/:slugOrCode/pledges",
@@ -18,6 +23,7 @@ router.use(authenticate, requireChurch);
 router.get("/", controller.listCampaigns);
 router.post("/", controller.createCampaign);
 router.get("/pledges", controller.listChurchPledges);
+router.post("/pledges/:pledgeId/fulfill", controller.fulfillPledge);
 router.get("/:campaignId", controller.getCampaign);
 router.patch("/:campaignId", controller.updateCampaign);
 router.get("/:campaignId/pledges", controller.listPledges);

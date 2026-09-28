@@ -10,6 +10,13 @@ const publicKey = fs.readFileSync(
 );
 
 let io;
+const STAFF_ROLES = new Set([
+  "admin",
+  "manager",
+  "staff",
+  "super-admin",
+  "superadmin",
+]);
 
 /**
  * ==========================================
@@ -79,7 +86,7 @@ const initializeSocket = (ioInstance) => {
       /**
        * Automatically join church room
        */
-      if (socket.user.churchId) {
+      if (socket.user.churchId && STAFF_ROLES.has(socket.user.role)) {
         const churchId = socket.user.churchId;
         socket.join(`church:${churchId}`);
 
@@ -99,7 +106,11 @@ const initializeSocket = (ioInstance) => {
       if (!churchId) return;
 
       const currentChurchId = socket.user?.churchId;
-      if (!currentChurchId || currentChurchId !== churchId) {
+      if (
+        !currentChurchId ||
+        currentChurchId !== churchId ||
+        !STAFF_ROLES.has(socket.user?.role)
+      ) {
         return;
       }
 
@@ -127,7 +138,9 @@ const initializeSocket = (ioInstance) => {
         return;
       }
 
-      socket.join(`church:${churchId}`);
+      if (socket.user?.id && STAFF_ROLES.has(socket.user.role)) {
+        socket.join(`church:${churchId}`);
+      }
 
       socket.join(`queue:${queueId}`);
 
@@ -164,6 +177,7 @@ const initializeSocket = (ioInstance) => {
       const currentChurchId = socket.user?.churchId;
       if (!currentChurchId || !churchId || !campaignId) return;
       if (currentChurchId !== churchId) return;
+      if (!STAFF_ROLES.has(socket.user?.role)) return;
       const campaign = await db.pledgeCampaigns.findOne({
         where: { id: campaignId, churchId },
         attributes: ["id"],

@@ -1,10 +1,10 @@
 const attempts = new Map();
 
 const pledgeRateLimit = (req, res, next) => {
-  const key = `${req.ip}:${req.params.slug || req.params.campaignId || "campaign"}`;
+  const key = `${req.ip}:${req.params.slugOrCode || req.params.slug || req.params.campaignId || "campaign"}`;
   const now = Date.now();
   const windowMs = 60 * 1000;
-  const maxAttempts = 10;
+  const maxAttempts = req.path.endsWith("/pledges/receipt") ? 120 : 10;
   const recent = (attempts.get(key) || []).filter(
     (timestamp) => now - timestamp < windowMs,
   );

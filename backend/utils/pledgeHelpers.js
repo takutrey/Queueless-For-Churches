@@ -49,6 +49,38 @@ const fromCents = (value) => {
   return value < 0n ? `-${result}` : result;
 };
 
+const getPledgeRemaining = (pledge) => {
+  const monetaryRemaining = pledge.monetaryAmount
+    ? fromCents(
+        toCents(pledge.monetaryAmount) -
+          toCents(pledge.fulfilledMonetaryAmount),
+      )
+    : null;
+  return {
+    monetaryRemaining:
+      monetaryRemaining && monetaryRemaining.startsWith("-")
+        ? "0.00"
+        : monetaryRemaining,
+    items: (pledge.items || []).map((item) => {
+      const scale = 1000n;
+      const quantityUnits = (value) => {
+        const [whole, fraction = ""] = String(value || "0").split(".");
+        return (
+          BigInt(whole || "0") * scale +
+          BigInt(fraction.padEnd(3, "0").slice(0, 3) || "0")
+        );
+      };
+      const remaining =
+        quantityUnits(item.quantity) - quantityUnits(item.fulfilledQuantity);
+      const safeRemaining = remaining > 0n ? remaining : 0n;
+      return {
+        pledgeItemId: item.id,
+        remainingQuantity: `${safeRemaining / scale}.${String(safeRemaining % scale).padStart(3, "0")}`,
+      };
+    }),
+  };
+};
+
 const derivePledgeStatus = ({
   monetaryAmount,
   fulfilledMonetaryAmount,
@@ -255,6 +287,7 @@ module.exports = {
   calculateCampaignTotals,
   calculateCampaignItemTotals,
   derivePledgeStatus,
+  getPledgeRemaining,
   getCompletedItemStatus,
   parseAmount,
   parseQuantity,

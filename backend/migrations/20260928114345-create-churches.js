@@ -35,10 +35,6 @@ module.exports = {
           type: DataTypes.STRING,
           allowNull: true
         },
-        churchSettingsId: {
-          type: DataTypes.UUID,
-          allowNull: true
-        },
         status: {
           type: DataTypes.ENUM(["active","inactive"]),
           allowNull: false,
