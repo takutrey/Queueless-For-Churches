@@ -11,7 +11,13 @@ test("normalizes common phone punctuation and local numbers", () => {
   assert.equal(normalizePhone(null, "263"), null);
 });
 
-test("leaves a local leading zero unchanged without configured country code", () => {
+test("matches a locally entered queue phone with a normalized pledge phone", () => {
+  const queuePhone = normalizePhone("077 123 4567", "263");
+  const pledgePhone = normalizePhone("+263771234567", "263");
+  assert.equal(queuePhone, pledgePhone);
+});
+
+test("leaves a local number unchanged only when explicitly configured without a country code", () => {
   assert.equal(normalizePhone("077 123 4567", ""), "0771234567");
 });
 

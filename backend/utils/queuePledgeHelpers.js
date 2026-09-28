@@ -1,6 +1,6 @@
 const normalizePhone = (
   phone,
-  countryCode = process.env.CHURCH_COUNTRY_CODE,
+  countryCode = process.env.CHURCH_COUNTRY_CODE || "263",
 ) => {
   if (typeof phone !== "string" || !phone.trim()) return null;
 
