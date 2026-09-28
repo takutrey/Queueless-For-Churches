@@ -40,6 +40,10 @@ module.exports = {
           allowNull: false,
           defaultValue: "active"
         },
+        churchSettingsId: {
+          type: DataTypes.UUID,
+          allowNull: true
+        },
         createdAt: {
           type: DataTypes.DATE,
           allowNull: false,
