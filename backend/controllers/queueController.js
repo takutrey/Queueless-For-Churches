@@ -1770,7 +1770,6 @@ const getQueuePledges = async (req, res) => {
         },
       ],
       limit: 20,
-      order: [["createdAt", "DESC"]],
     });
     return res.json({ pledges: pledges.map(serializeQueuePledge) });
   } catch (error) {

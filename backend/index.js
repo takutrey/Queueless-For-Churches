@@ -216,10 +216,17 @@ app.use(express.static("public"));
 // A broad regex route shadows every more-specific route registered after it,
 // so with the old order every /admin/* request was answered by the public
 // site's index.html and the admin app was unreachable.
-app.use("/admin", express.static(path.join(__dirname, "admin/dist")));
+const adminDistPath = path.join(__dirname, "admin/dist");
+const adminIndexPath = path.join(adminDistPath, "index.html");
 
-app.get(/^\/admin(\/.*)?$/, (req, res) => {
-  res.sendFile(path.join(__dirname, "admin/dist", "index.html"));
+app.get(["/admin", "/admin/"], (_req, res) => {
+  res.sendFile(adminIndexPath);
+});
+
+app.use("/admin", express.static(adminDistPath));
+
+app.get(/^\/admin\/.+$/, (_req, res) => {
+  res.sendFile(adminIndexPath);
 });
 
 // WEB — public catch-all, must stay last since /.*/ matches everything.
