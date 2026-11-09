@@ -18,6 +18,32 @@ export type QueueEntryStatus =
 export type StaffAssignmentStatus = "active" | "inactive";
 export type QueueEntryType = "normal" | "transfer";
 
+export interface QueuePledgeMatch {
+  id: string;
+  name: string;
+  phone: string;
+  monetaryAmount: string | null;
+  fulfilledMonetaryAmount: string;
+  remainingMonetaryAmount: string | null;
+  status: string;
+  items: Array<{
+    id: string;
+    campaignItemId: string;
+    name: string;
+    unit: string;
+    quantity: string;
+    fulfilledQuantity: string;
+    remainingQuantity: string;
+  }>;
+}
+
+export interface QueuePledgeService {
+  type: "PLEDGE_CAMPAIGN";
+  campaign: { id: string; title: string; status: string; currency?: string } | null;
+  matchedPledges: QueuePledgeMatch[];
+  matchStatus: "SINGLE_MATCH" | "MULTIPLE_MATCHES" | "NO_MATCH";
+}
+
 // ============================================================
 // Core models
 // ============================================================
@@ -75,6 +101,7 @@ export interface QueueEntry {
   completedAt?: string | null;
   skippedAt?: string | null;
   leftAt?: string | null;
+  service?: QueuePledgeService;
 }
 
 /**
@@ -109,6 +136,9 @@ export interface Queue {
   estimatedServiceTime: number;
   maxCustomers: number | null;
   allowWalkIns: boolean;
+  serviceType?: "GENERAL" | "PLEDGE_CAMPAIGN";
+  campaignId?: string | null;
+  campaign?: { id: string; title: string; status: string; currency?: string } | null;
   createdAt?: string;
   updatedAt?: string;
 
@@ -200,12 +230,16 @@ export interface DeleteQueueResponse {
 
 export interface GetWaitingCustomersResponse {
   count: number;
+  visibleCount?: number;
+  limit?: number;
+  hasMore?: boolean;
   customers: QueueEntry[];
 }
 
 export interface CallNextResponse {
   message: string;
   entry: QueueEntry & { staffId: string };
+  service?: QueuePledgeService;
   completedEntryId?: string | null;
 }
 
@@ -281,6 +315,9 @@ export interface AuthQueueState {
   queues: AsyncSlice<Queue[]>;
   currentQueue: AsyncSlice<Queue | null>;
   waitingCustomers: AsyncSlice<QueueEntry[]>;
+  currentCall: QueueEntry | null;
+  waitingCustomersTotalCount: number;
+  waitingCustomersHasMore: boolean;
   churchStaff: AsyncSlice<ChurchStaffMember[]>;
   connection: ConnectionState;
 }

@@ -31,6 +31,7 @@ const {
   assignStaff,
   removeStaff,
 } = require("../controllers/queueController");
+const pledgeController = require("../controllers/pledgeController");
 
 const { passport } = require("../config/passport");
 
@@ -153,6 +154,14 @@ router.get("/:queueId/customers", authenticate, getWaitingCustomers);
 
 router.get("/:queueId/pledges/search", authenticate, getQueuePledges);
 router.post("/:queueId/pledges", authenticate, createQueuePledge);
+router.patch(
+  "/:queueId/pledges/:pledgeId/fulfill",
+  authenticate,
+  (req, res) => {
+    req.body.queueId = req.params.queueId;
+    return pledgeController.fulfillQueuePledge(req, res);
+  },
+);
 router.get("/:queueId/current-service", authenticate, getCurrentQueueService);
 
 /**

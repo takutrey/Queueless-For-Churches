@@ -2486,15 +2486,25 @@ const getWaitingCustomers = async (req, res) => {
       });
     }
 
-    const entries = await QueueEntry.findAll({
-      where: {
-        queueId,
-        status: {
-          [Op.in]: ["waiting", "standby", "called", "serving", "skipped"],
-        },
-      },
-      order: [["queueNumber", "ASC"]],
-    });
+    const activeWhere = {
+      queueId,
+      status: { [Op.in]: ["waiting", "standby", "called", "serving"] },
+    };
+    const [totalCount, activeEntries, skippedEntries] = await Promise.all([
+      QueueEntry.count({ where: activeWhere }),
+      QueueEntry.findAll({
+        where: activeWhere,
+        order: [["queueNumber", "ASC"]],
+        limit: 20,
+      }),
+      QueueEntry.findAll({
+        where: { queueId, status: "skipped" },
+        order: [["queueNumber", "DESC"]],
+        limit: 10,
+      }),
+    ]);
+
+    const entries = [...activeEntries, ...skippedEntries];
 
     const customers = entries.map((entry) => ({
       ...entry.toJSON(),
@@ -2503,7 +2513,10 @@ const getWaitingCustomers = async (req, res) => {
     }));
 
     return res.status(200).json({
-      count: customers.length,
+      count: totalCount,
+      visibleCount: activeEntries.length,
+      limit: 20,
+      hasMore: totalCount > activeEntries.length,
       customers,
     });
   } catch (error) {

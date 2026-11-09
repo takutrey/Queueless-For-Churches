@@ -211,7 +211,7 @@ export const fetchChurchStaff = createAsyncThunk<
 });
 
 export const fetchWaitingCustomers = createAsyncThunk<
-  QueueEntry[],
+  { customers: QueueEntry[]; totalCount: number; hasMore: boolean },
   string,
   { rejectValue: string }
 >("authQueue/fetchWaitingCustomers", async (queueId, { rejectWithValue }) => {
@@ -220,7 +220,11 @@ export const fetchWaitingCustomers = createAsyncThunk<
     const response = await api.get<GetWaitingCustomersResponse>(
       `/queues/${queueId}/customers`,
     );
-    return response.data.customers;
+    return {
+      customers: response.data.customers,
+      totalCount: response.data.count,
+      hasMore: response.data.hasMore ?? false,
+    };
   } catch (err) {
     return rejectWithValue(
       extractErrorMessage(err, "Failed to load waiting customers"),
@@ -241,6 +245,7 @@ export const callNextCustomer = createAsyncThunk<
     return {
       ...response.data.entry,
       completedEntryId: response.data.completedEntryId,
+      service: response.data.service,
     };
   } catch (err) {
     return rejectWithValue(
@@ -265,6 +270,7 @@ export const callQueueRange = createAsyncThunk<
       return {
         ...response.data.entry,
         completedEntryId: response.data.completedEntryId,
+        service: response.data.service,
       };
     } catch (err) {
       return rejectWithValue(
@@ -379,6 +385,7 @@ export const callSpecificEntry = createAsyncThunk<
       return {
         ...response.data.entry,
         completedEntryId: response.data.completedEntryId,
+        service: response.data.service,
       };
     } catch (err) {
       return rejectWithValue(
@@ -460,6 +467,9 @@ const initialState: AuthQueueState = {
   queues: { data: [], status: "idle", error: null },
   currentQueue: { data: null, status: "idle", error: null },
   waitingCustomers: { data: [], status: "idle", error: null },
+  waitingCustomersTotalCount: 0,
+  waitingCustomersHasMore: false,
+  currentCall: null,
   churchStaff: { data: [], status: "idle", error: null },
   connection: { online: true, socketConnected: false },
 };
@@ -626,6 +636,12 @@ const authQueueSlice = createSlice({
     resetCurrentQueue(state) {
       state.currentQueue = { data: null, status: "idle", error: null };
     },
+    setCurrentCall(state, action: PayloadAction<QueueEntry | null>) {
+      state.currentCall = action.payload;
+    },
+    clearCurrentCall(state) {
+      state.currentCall = null;
+    },
     resetAuthQueueState() {
       return initialState;
     },
@@ -746,7 +762,9 @@ const authQueueSlice = createSlice({
       })
       .addCase(fetchWaitingCustomers.fulfilled, (state, action) => {
         state.waitingCustomers.status = "succeeded";
-        state.waitingCustomers.data = action.payload;
+        state.waitingCustomers.data = action.payload.customers;
+        state.waitingCustomersTotalCount = action.payload.totalCount;
+        state.waitingCustomersHasMore = action.payload.hasMore;
       })
       .addCase(fetchWaitingCustomers.rejected, (state, action) => {
         state.waitingCustomers.status = "failed";
@@ -762,6 +780,7 @@ const authQueueSlice = createSlice({
         state.waitingCustomers.error = null;
       })
       .addCase(callNextCustomer.fulfilled, (state, action) => {
+        state.currentCall = action.payload;
         const completedEntryId = action.payload.completedEntryId;
         if (completedEntryId) {
           state.waitingCustomers.data = state.waitingCustomers.data.filter(
@@ -788,7 +807,12 @@ const authQueueSlice = createSlice({
           action.payload || action.error.message || null;
       })
 
+      .addCase(callQueueRange.fulfilled, (state, action) => {
+        if (action.payload.service) state.currentCall = action.payload;
+      })
+
       .addCase(callSpecificEntry.fulfilled, (state, action) => {
+        state.currentCall = action.payload;
         const completedEntryId = action.payload.completedEntryId;
         if (completedEntryId) {
           state.waitingCustomers.data = state.waitingCustomers.data.filter(
@@ -837,6 +861,9 @@ const authQueueSlice = createSlice({
 
       // completeEntry
       .addCase(completeEntry.fulfilled, (state, action) => {
+        if (state.currentCall?.id === action.payload.id) {
+          state.currentCall = null;
+        }
         state.waitingCustomers.data = state.waitingCustomers.data.filter(
           (e) => e.id !== action.payload.id,
         );
@@ -972,6 +999,8 @@ export const {
   staffRemovedRealtime,
   setAuthConnectionStatus,
   resetCurrentQueue,
+  setCurrentCall,
+  clearCurrentCall,
   resetAuthQueueState,
 } = authQueueSlice.actions;
 

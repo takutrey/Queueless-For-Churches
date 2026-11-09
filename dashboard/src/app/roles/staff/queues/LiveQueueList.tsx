@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useDispatch, useSelector } from "react-redux";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
@@ -25,9 +25,16 @@ import {
   callSpecificEntry,
   callQueueRange,
   transferEntry,
+  setCurrentCall,
 } from "@/lib/QueueSlice";
 import { useQueueRoom } from "@/contexts/SocketContext";
-import type { Queue, QueueEntryStatus } from "@/types/QueueTypes";
+import api from "@/utils/axiosInstance";
+import type {
+  Queue,
+  QueueEntryStatus,
+  QueuePledgeMatch,
+  QueuePledgeService,
+} from "@/types/QueueTypes";
 
 const ENTRY_STATUS_META: Record<
   QueueEntryStatus,
@@ -54,18 +61,143 @@ export function LiveQueueList({ queue }: { queue: Queue }) {
   const { data: entries, status } = useSelector(
     (state: RootState) => state.authQueue.waitingCustomers,
   );
+  const currentCall = useSelector((state: RootState) => state.authQueue.currentCall);
   const queues = useSelector((state: RootState) => state.authQueue.queues.data);
   const [targetQueueByEntry, setTargetQueueByEntry] = useState<
     Record<string, string>
   >({});
   const [fromNumber, setFromNumber] = useState("");
   const [toNumber, setToNumber] = useState("");
+  const [selectedPledgeId, setSelectedPledgeId] = useState<string | null>(null);
+  const [pledgeSearch, setPledgeSearch] = useState("");
+  const [pledgeSearchResults, setPledgeSearchResults] = useState<QueuePledgeMatch[]>([]);
+  const [pledgeSearchLoading, setPledgeSearchLoading] = useState(false);
+  const [pledgeSearchError, setPledgeSearchError] = useState<string | null>(null);
+  const [pledgeName, setPledgeName] = useState("");
+  const [pledgePhone, setPledgePhone] = useState("");
+  const [pledgeAmount, setPledgeAmount] = useState("");
+  const [fulfillmentAmount, setFulfillmentAmount] = useState("");
+  const [fulfillmentQuantities, setFulfillmentQuantities] = useState<Record<string, string>>({});
+  const [pledgeSaving, setPledgeSaving] = useState(false);
+  const [pledgeSaveError, setPledgeSaveError] = useState<string | null>(null);
+  const [fulfillmentError, setFulfillmentError] = useState<string | null>(null);
+  const [createdService, setCreatedService] = useState<{
+    entryId: string;
+    service: QueuePledgeService;
+  } | null>(null);
+  const idempotencyKey = useRef<string | null>(null);
 
   useQueueRoom(queue.id, queue.churchId);
 
   useEffect(() => {
     dispatch(fetchWaitingCustomers(queue.id));
   }, [dispatch, queue.id]);
+
+  useEffect(() => {
+    if (queue.serviceType !== "PLEDGE_CAMPAIGN") return;
+    let active = true;
+    api
+      .get<{
+        entry: Partial<QueueEntry> | null;
+        service: QueuePledgeService | null;
+      }>(`/queues/${queue.id}/current-service`)
+      .then(({ data }) => {
+        if (!active) return;
+        if (data.entry && data.service) {
+          dispatch(
+            setCurrentCall({
+              ...data.entry,
+              service: data.service,
+            } as QueueEntry),
+          );
+        } else if (currentCall?.queueId === queue.id) {
+          dispatch(setCurrentCall(null));
+        }
+      })
+      .catch((error: any) => {
+        if (active) {
+          toast.error(
+            error.response?.data?.message || "Unable to refresh the current pledge service",
+          );
+        }
+      });
+    return () => {
+      active = false;
+    };
+  }, [currentCall?.queueId, dispatch, queue.id, queue.serviceType]);
+
+  const activeCall = currentCall?.queueId === queue.id ? currentCall : null;
+  const service =
+    activeCall && createdService?.entryId === activeCall.id
+      ? createdService.service
+      : activeCall?.service || null;
+  const allServicePledges = [
+    ...(service?.matchedPledges || []),
+    ...pledgeSearchResults.filter(
+      (result) => !service?.matchedPledges.some((match) => match.id === result.id),
+    ),
+  ];
+  const selectedPledge = allServicePledges.find(
+    (pledge) => pledge.id === selectedPledgeId,
+  );
+
+  useEffect(() => {
+    if (!activeCall) return;
+    setSelectedPledgeId(
+      activeCall.service?.matchStatus === "SINGLE_MATCH"
+        ? activeCall.service.matchedPledges[0]?.id || null
+        : null,
+    );
+    setPledgeSearchResults([]);
+    setPledgeSearch(activeCall.customerPhone || activeCall.customerName || "");
+    setPledgeSearchError(null);
+    setPledgeSaveError(null);
+    setFulfillmentError(null);
+    setFulfillmentAmount("");
+    setFulfillmentQuantities({});
+    idempotencyKey.current = null;
+    setCreatedService(null);
+    setPledgeName(activeCall.customerName);
+    setPledgePhone(activeCall.customerPhone || "");
+    setPledgeAmount("");
+  }, [activeCall?.id]);
+
+  useEffect(() => {
+    if (!activeCall || pledgeSearch.trim().length < 3) {
+      setPledgeSearchResults([]);
+      setPledgeSearchError(null);
+      return;
+    }
+    let active = true;
+    setPledgeSearchLoading(true);
+    api
+      .get<{ pledges: QueuePledgeMatch[] }>(
+        `/queues/${queue.id}/pledges/search`,
+        { params: { q: pledgeSearch.trim() } },
+      )
+      .then(({ data }) => {
+        if (active) setPledgeSearchResults(data.pledges);
+      })
+      .catch((error: any) => {
+        if (active) {
+          setPledgeSearchError(
+            error.response?.data?.message || "Unable to search campaign pledges",
+          );
+        }
+      })
+      .finally(() => {
+        if (active) setPledgeSearchLoading(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [activeCall?.id, pledgeSearch, queue.id]);
+
+  useEffect(() => {
+    if (service?.matchStatus === "NO_MATCH" && pledgeSearchResults.length === 1) {
+      setSelectedPledgeId(pledgeSearchResults[0].id);
+    }
+  }, [pledgeSearchResults, service?.matchStatus]);
 
   const activeEntries = entries.filter((entry) =>
     ["waiting", "standby", "called", "serving"].includes(entry.status),
@@ -83,6 +215,19 @@ export function LiveQueueList({ queue }: { queue: Queue }) {
   const hasActiveEntry = activeEntries.some((entry) =>
     ["called", "serving"].includes(entry.status),
   );
+  const waitingCustomersTotalCount = useSelector(
+    (state: RootState) => state.authQueue.waitingCustomersTotalCount,
+  );
+  const waitingCustomersHasMore = useSelector(
+    (state: RootState) => state.authQueue.waitingCustomersHasMore,
+  );
+  const money = (value: string | null, currency = "USD") =>
+    value == null
+      ? "Not set"
+      : Number(value).toLocaleString(undefined, {
+          style: "currency",
+          currency,
+        });
 
   const handleCallNext = async () => {
     try {
@@ -91,6 +236,83 @@ export function LiveQueueList({ queue }: { queue: Queue }) {
       toast.error(errorMessage(error, "Failed to call next customer"));
     }
   };
+
+  const handleCreatePledge = async () => {
+    if (!activeCall || !service || service.matchStatus !== "NO_MATCH") return;
+    if (!idempotencyKey.current) {
+      idempotencyKey.current = globalThis.crypto.randomUUID();
+    }
+    setPledgeSaving(true);
+    setPledgeSaveError(null);
+    try {
+      const { data } = await api.post(`/queues/${queue.id}/pledges`, {
+        name: pledgeName,
+        phone: pledgePhone,
+        monetaryAmount: pledgeAmount,
+        idempotencyKey: idempotencyKey.current,
+      });
+      setCreatedService({
+        entryId: activeCall.id,
+        service: {
+          ...service,
+          matchedPledges: [data.pledge],
+          matchStatus: "SINGLE_MATCH",
+        },
+      });
+      setSelectedPledgeId(data.pledge.id);
+      setPledgeSearchResults([]);
+      idempotencyKey.current = null;
+      toast.success("Pledge recorded");
+    } catch (error: any) {
+      setPledgeSaveError(
+        error.response?.data?.message || "Unable to create pledge. Please retry.",
+      );
+    } finally {
+      setPledgeSaving(false);
+    }
+  };
+
+  const handleFulfillPledge = async (pledge: QueuePledgeMatch) => {
+    if (!activeCall || !service) return;
+    const items = pledge.items
+      .filter((item) => fulfillmentQuantities[item.id])
+      .map((item) => ({
+        pledgeItemId: item.id,
+        quantity: fulfillmentQuantities[item.id],
+      }));
+    if (!fulfillmentAmount && !items.length) return;
+    setPledgeSaving(true);
+    setFulfillmentError(null);
+    try {
+      const { data } = await api.patch(
+        `/queues/${queue.id}/pledges/${pledge.id}/fulfill`,
+        { amount: fulfillmentAmount || undefined, items },
+      );
+      const updatedPledge = data.pledge as QueuePledgeMatch;
+      const nextService: QueuePledgeService = {
+        ...service,
+        matchedPledges: service.matchedPledges.map((item) =>
+          item.id === updatedPledge.id ? updatedPledge : item,
+        ),
+      };
+      setCreatedService({ entryId: activeCall.id, service: nextService });
+      setSelectedPledgeId(updatedPledge.id);
+      setFulfillmentAmount("");
+      setFulfillmentQuantities({});
+      toast.success("Pledge fulfillment recorded");
+    } catch (error: any) {
+      setFulfillmentError(
+        error.response?.data?.message || "Unable to save fulfillment. Please retry.",
+      );
+    } finally {
+      setPledgeSaving(false);
+    }
+  };
+
+  const selectedPledge =
+    service?.matchedPledges.find((pledge) => pledge.id === selectedPledgeId) ||
+    pledgeSearchResults.find((pledge) => pledge.id === selectedPledgeId) ||
+    null;
 
   const handleSkip = async (entryId: string) => {
     try {
@@ -325,9 +547,196 @@ export function LiveQueueList({ queue }: { queue: Queue }) {
           Calling next completes the current customer and starts the next one.
         </p>
       )}
+      {activeCall && service && (
+        <section className="space-y-4 rounded-md border p-4">
+          <header className="flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <h3 className="text-sm font-semibold">Member being served</h3>
+              <p className="text-sm">{activeCall.customerName}</p>
+              <p className="text-xs text-muted-foreground">
+                {activeCall.customerPhone || "No phone provided"}
+              </p>
+            </div>
+            <div className="text-right">
+              <Badge variant="secondary">
+                {service.campaign?.title || "Pledge campaign"}
+              </Badge>
+              <p className="mt-1 text-xs text-muted-foreground">
+                {activeCall.ticketNumber || `${queue.prefix}${activeCall.queueNumber}`}
+              </p>
+            </div>
+          </header>
+
+          {service.campaign?.status !== "ACTIVE" && (
+            <p className="rounded-md bg-amber-50 p-3 text-sm text-amber-900">
+              {service.campaign
+                ? `This campaign is ${service.campaign.status.toLowerCase()}. Existing pledges can still be fulfilled.`
+                : "No campaign is linked. Members can still be called."}
+            </p>
+          )}
+
+          {service.matchStatus === "MULTIPLE_MATCHES" && !selectedPledge && (
+            <div className="space-y-2">
+              <p className="text-sm font-medium">
+                Multiple pledges match this phone. Select the member’s existing pledge:
+              </p>
+              {allServicePledges.map((pledge) => (
+                <button
+                  key={pledge.id}
+                  type="button"
+                  className="flex w-full flex-wrap items-center justify-between gap-2 rounded-md border p-3 text-left hover:bg-muted"
+                  onClick={() => setSelectedPledgeId(pledge.id)}
+                >
+                  <span>
+                    <strong>{pledge.name}</strong>
+                    <span className="ml-2 text-sm text-muted-foreground">{pledge.phone}</span>
+                  </span>
+                  <span className="text-sm">
+                    {money(pledge.monetaryAmount, service.campaign?.currency)} · {pledge.status}
+                  </span>
+                </button>
+              ))}
+            </div>
+          )}
+
+          {selectedPledge && (
+            <div className="space-y-3 rounded-md bg-muted/20 p-3">
+              <div className="flex flex-wrap items-start justify-between gap-2">
+                <div>
+                  <h4 className="text-sm font-semibold">Existing pledge · {selectedPledge.name}</h4>
+                  <p className="text-xs text-muted-foreground">{selectedPledge.phone}</p>
+                </div>
+                <Badge variant={selectedPledge.status === "FULFILLED" ? "default" : selectedPledge.status === "PARTIALLY_FULFILLED" ? "secondary" : "outline"}>
+                  {selectedPledge.status === "PLEDGED" ? "Not fulfilled" : selectedPledge.status.replaceAll("_", " ").toLowerCase()}
+                </Badge>
+              </div>
+              {selectedPledge.monetaryAmount != null && (
+                <div className="grid gap-2 text-sm sm:grid-cols-3">
+                  <p>Pledged: {money(selectedPledge.monetaryAmount, service.campaign?.currency)}</p>
+                  <p>Fulfilled: {money(selectedPledge.fulfilledMonetaryAmount, service.campaign?.currency)}</p>
+                  <p>Remaining: {money(selectedPledge.remainingMonetaryAmount, service.campaign?.currency)}</p>
+                </div>
+              )}
+              {selectedPledge.items?.length > 0 && (
+                <div className="divide-y rounded-md border bg-background">
+                  {selectedPledge.items.map((item) => (
+                        <div key={item.id} className="grid gap-2 p-3 sm:grid-cols-[1fr_10rem] sm:items-center">
+                          <div className="text-sm">
+                            <strong>{item.name}</strong>
+                            <p className="text-xs text-muted-foreground">
+                              {item.quantity} {item.unit} pledged · {item.fulfilledQuantity} fulfilled · {item.remainingQuantity} remaining
+                            </p>
+                          </div>
+                          <Input
+                            type="number"
+                            min="0.001"
+                            step="0.001"
+                            value={fulfillmentQuantities[item.id] || ""}
+                            onChange={(event) =>
+                              setFulfillmentQuantities((current) => ({
+                                ...current,
+                                [item.id]: event.target.value,
+                              }))
+                            }
+                            aria-label={`Additional ${item.name} quantity fulfilled`}
+                            placeholder={`Add ${item.unit}`}
+                          />
+                        </div>
+                  ))}
+                </div>
+              )}
+                  <div className="grid gap-2 rounded-md border p-3 sm:grid-cols-[1fr_12rem] sm:items-end">
+                    <label className="text-sm font-medium" htmlFor={`fulfill-amount-${selectedPledge.id}`}>
+                      Monetary amount received ({service.campaign?.currency || "USD"})
+                    </label>
+                    <Input
+                      id={`fulfill-amount-${selectedPledge.id}`}
+                      type="number"
+                      min="0.01"
+                      step="0.01"
+                      value={fulfillmentAmount}
+                      onChange={(event) => setFulfillmentAmount(event.target.value)}
+                      placeholder="Optional amount"
+                    />
+                    {fulfillmentError && (
+                      <p role="alert" className="text-sm text-destructive sm:col-span-2">
+                        {fulfillmentError}
+                      </p>
+                    )}
+                    <Button
+                      className="sm:col-span-2"
+                      disabled={
+                        pledgeSaving ||
+                        (!fulfillmentAmount && !Object.values(fulfillmentQuantities).some(Boolean))
+                      }
+                      onClick={() => void handleFulfillPledge(selectedPledge)}
+                    >
+                      {pledgeSaving ? "Saving fulfillment…" : "Record fulfillment"}
+                    </Button>
+                  </div>
+              {service.matchStatus === "MULTIPLE_MATCHES" && (
+                <Button size="sm" variant="outline" onClick={() => setSelectedPledgeId(null)}>
+                  Choose a different pledge
+                </Button>
+              )}
+            </div>
+          )}
+
+          {service.matchStatus === "NO_MATCH" && !selectedPledge && (
+            <div className="space-y-3">
+              <p className="text-sm">
+                No existing pledge matched this phone. Search this campaign before creating a new pledge.
+              </p>
+              <Input
+                value={pledgeSearch}
+                onChange={(event) => setPledgeSearch(event.target.value)}
+                placeholder="Search by name or phone"
+                aria-label="Search existing pledges"
+              />
+              {pledgeSearchLoading && <p className="text-xs text-muted-foreground">Searching pledges…</p>}
+              {pledgeSearchError && <p role="alert" className="text-sm text-destructive">{pledgeSearchError}</p>}
+              {pledgeSearchResults.map((pledge) => (
+                <button
+                  type="button"
+                  key={pledge.id}
+                  className="flex w-full items-center justify-between gap-2 rounded-md border p-3 text-left hover:bg-muted"
+                  onClick={() => setSelectedPledgeId(pledge.id)}
+                >
+                  <span><strong>{pledge.name}</strong><span className="ml-2 text-xs text-muted-foreground">{pledge.phone}</span></span>
+                  <span className="text-sm">{pledge.status}</span>
+                </button>
+              ))}
+              {pledgeSearch.trim().length >= 3 &&
+                !pledgeSearchLoading &&
+                !pledgeSearchError &&
+                pledgeSearchResults.length === 0 &&
+                service.campaign?.status === "ACTIVE" && (
+                  <div className="grid gap-2 rounded-md border p-3 sm:grid-cols-2">
+                    <p className="text-sm font-medium sm:col-span-2">No pledge found. Create one for this member.</p>
+                    <Input value={pledgeName} onChange={(event) => setPledgeName(event.target.value)} aria-label="Member name" placeholder="Member name" />
+                    <Input value={pledgePhone} onChange={(event) => setPledgePhone(event.target.value)} aria-label="Member phone" placeholder="Member phone" />
+                    <Input type="number" min="1" step="0.01" value={pledgeAmount} onChange={(event) => setPledgeAmount(event.target.value)} aria-label="Pledge amount" placeholder={`Amount (${service.campaign.currency || "USD"})`} className="sm:col-span-2" />
+                    {pledgeSaveError && <p role="alert" className="text-sm text-destructive sm:col-span-2">{pledgeSaveError}</p>}
+                    <Button className="sm:col-span-2" disabled={pledgeSaving || !pledgeName.trim() || !pledgePhone.trim() || !pledgeAmount} onClick={() => void handleCreatePledge()}>
+                      {pledgeSaving ? "Saving pledge…" : "Create pledge"}
+                    </Button>
+                  </div>
+                )}
+            </div>
+          )}
+        </section>
+      )}
       <div className="grid gap-4 md:grid-cols-2 items-start">
         <section className="space-y-2">
-          <h3 className="text-sm font-semibold">Queue</h3>
+          <div className="flex items-center justify-between gap-2">
+            <h3 className="text-sm font-semibold">Queue</h3>
+            <span className="text-xs text-muted-foreground">
+              Showing {regularEntries.length} of {waitingCustomersTotalCount} active members
+            </span>
+          </div>
+          {waitingCustomersHasMore && (
+            <p className="text-xs text-muted-foreground">Calling next advances through the full queue. Only the next 20 active members are shown here.</p>
+          )}
           {regularEntries.length ? (
             <div className="space-y-2">{regularEntries.map(renderEntry)}</div>
           ) : (

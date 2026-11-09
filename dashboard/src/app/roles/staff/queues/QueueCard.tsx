@@ -59,6 +59,7 @@ export function QueueCard({
     setIsCalling(true);
     try {
       await dispatch(callNextCustomer(queue.id)).unwrap();
+      if (queue.serviceType === "PLEDGE_CAMPAIGN") onManage(queue);
       toast.success("Customer called!");
     } catch (err: any) {
       toast.error(err || "Failed to call next customer");

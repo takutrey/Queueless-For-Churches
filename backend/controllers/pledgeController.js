@@ -17,6 +17,8 @@ const { getIO } = require("../config/socket");
 const Campaign = db.pledgeCampaigns;
 const Pledge = db.pledges;
 const Church = db.churches;
+const Queue = db.queues;
+const QueueStaff = db.queueStaff;
 
 const allowedStatuses = ["DRAFT", "ACTIVE", "PAUSED", "COMPLETED", "CANCELLED"];
 
@@ -157,6 +159,176 @@ const emitDashboardPledge = (pledge, totals, items = []) => {
     });
   } catch (error) {
     console.error("Campaign admin pledge socket error:", error.message);
+  }
+};
+
+const toScaledUnits = (value, scale) => {
+  const [whole, fraction = ""] = String(value || "0").split(".");
+  return (
+    BigInt(whole || "0") * 10n ** BigInt(scale) +
+    BigInt(fraction.padEnd(scale, "0").slice(0, scale) || "0")
+  );
+};
+
+const fromScaledUnits = (value, scale) => {
+  const factor = 10n ** BigInt(scale);
+  return `${value / factor}.${String(value % factor).padStart(scale, "0")}`;
+};
+
+const fulfillQueuePledge = async (req, res) => {
+  try {
+    const { pledgeId } = req.params;
+    const queueId = req.params.queueId || req.body.queueId;
+    const churchId = req.user.churchId;
+    if (!queueId) return res.status(400).json({ message: "Queue ID is required" });
+
+    const queue = await Queue.findOne({
+      where: { id: queueId, churchId, serviceType: "PLEDGE_CAMPAIGN" },
+    });
+    if (!queue) return res.status(404).json({ message: "Pledge queue not found" });
+    const assignment = await QueueStaff.findOne({
+      where: { queueId, churchId, userId: req.user.id, status: "active" },
+    });
+    if (!assignment) return res.status(403).json({ message: "You are not assigned to this queue" });
+
+    const amountInput = req.body.monetaryAmount ?? req.body.amount;
+    const amountText = amountInput == null ? "" : String(amountInput).trim();
+    const parsedAmount = /^\d+(\.\d{1,2})?$/.test(amountText) && Number(amountText) > 0
+      ? (() => {
+          const [whole, fraction = ""] = amountText.split(".");
+          return `${whole}.${fraction.padEnd(2, "0")}`;
+        })()
+      : null;
+    if (amountText && !parsedAmount) {
+      return res.status(400).json({ message: "Enter a valid positive amount" });
+    }
+
+    const requestedItems = Array.isArray(req.body.items) ? req.body.items : [];
+    const itemFulfillments = requestedItems.map((item) => {
+      const quantityText = String(item.quantity ?? "").trim();
+      const quantity = /^\d+(\.\d{1,3})?$/.test(quantityText) && Number(quantityText) > 0
+        ? (() => {
+            const [whole, fraction = ""] = quantityText.split(".");
+            return `${whole}.${fraction.padEnd(3, "0")}`;
+          })()
+        : null;
+      return { pledgeItemId: item.pledgeItemId || item.id, quantity };
+    });
+    if (itemFulfillments.some((item) => !item.pledgeItemId || !item.quantity)) {
+      return res.status(400).json({ message: "Each material fulfillment needs a valid item and positive quantity" });
+    }
+    if (!parsedAmount && !itemFulfillments.length) {
+      return res.status(400).json({ message: "Enter an amount or one or more material quantities" });
+    }
+
+    const pledge = await db.sequelize.transaction(async (transaction) => {
+      const current = await Pledge.findByPk(pledgeId, {
+        transaction,
+        lock: transaction.LOCK.UPDATE,
+        include: [{
+          model: db.pledgeItems,
+          as: "items",
+          include: [{
+            model: db.pledgeCampaignItems,
+            as: "campaignItem",
+            attributes: ["id", "name", "unit"],
+          }],
+        }],
+      });
+      if (!current || current.campaignId !== queue.campaignId) {
+        const error = new Error("Pledge not found for this queue's campaign");
+        error.status = 404;
+        throw error;
+      }
+      if (current.status === "CANCELLED") {
+        const error = new Error("A cancelled pledge cannot be fulfilled");
+        error.status = 409;
+        throw error;
+      }
+
+      if (parsedAmount) {
+        if (!current.monetaryAmount) {
+          const error = new Error("This pledge has no monetary amount");
+          error.status = 400;
+          throw error;
+        }
+        const nextAmount = toScaledUnits(current.fulfilledMonetaryAmount, 2) + toScaledUnits(parsedAmount, 2);
+        if (nextAmount > toScaledUnits(current.monetaryAmount, 2)) {
+          const error = new Error("Fulfillment exceeds the pledged monetary amount");
+          error.status = 400;
+          throw error;
+        }
+        current.fulfilledMonetaryAmount = fromScaledUnits(nextAmount, 2);
+      }
+
+      const pledgeItems = new Map((current.items || []).map((item) => [item.id, item]));
+      for (const fulfillment of itemFulfillments) {
+        const item = pledgeItems.get(fulfillment.pledgeItemId);
+        if (!item) {
+          const error = new Error("Material item does not belong to this pledge");
+          error.status = 404;
+          throw error;
+        }
+        const nextQuantity = toScaledUnits(item.fulfilledQuantity, 3) + toScaledUnits(fulfillment.quantity, 3);
+        if (nextQuantity > toScaledUnits(item.quantity, 3)) {
+          const error = new Error(`Fulfillment exceeds the pledged quantity for ${item.campaignItem?.name || "this item"}`);
+          error.status = 400;
+          throw error;
+        }
+        item.fulfilledQuantity = fromScaledUnits(nextQuantity, 3);
+        await item.save({ transaction });
+      }
+
+      current.status = derivePledgeStatus({
+        monetaryAmount: current.monetaryAmount,
+        fulfilledMonetaryAmount: current.fulfilledMonetaryAmount,
+        items: current.items,
+      });
+      await current.save({ transaction });
+      return Pledge.findByPk(current.id, {
+        transaction,
+        include: [{
+          model: db.pledgeItems,
+          as: "items",
+          include: [{
+            model: db.pledgeCampaignItems,
+            as: "campaignItem",
+            attributes: ["id", "name", "unit"],
+          }],
+        }],
+      });
+    });
+
+    const totals = await calculateCampaignTotals(pledge.campaignId);
+    const campaignItems = await db.pledgeCampaignItems.findAll({
+      where: { campaignId: pledge.campaignId },
+      attributes: ["id"],
+    });
+    const itemTotals = await Promise.all(
+      campaignItems.map((item) => calculateCampaignItemTotals(item.id)),
+    );
+    const freshTotals = { ...totals, itemTotals };
+    emitTotals(freshTotals);
+    emitDashboardPledge(pledge, freshTotals, pledge.items);
+
+    const remaining = getPledgeRemaining(pledge);
+    return res.json({
+      pledge: {
+        ...pledge.toJSON(),
+        remainingMonetaryAmount: remaining.monetaryRemaining,
+        items: (pledge.items || []).map((item) => ({
+          ...item.toJSON(),
+          name: item.campaignItem?.name || "Material item",
+          unit: item.campaignItem?.unit || "",
+          remainingQuantity: remaining.items.find((value) => value.pledgeItemId === item.id)?.remainingQuantity || "0.000",
+        })),
+      },
+      totals: freshTotals,
+    });
+  } catch (error) {
+    if (error.status) return res.status(error.status).json({ message: error.message });
+    console.error("Queue pledge fulfillment error:", error);
+    return res.status(500).json({ message: "Unable to record pledge fulfillment" });
   }
 };
 
@@ -1296,6 +1468,7 @@ module.exports = {
   getPublicCampaign,
   getPublicPledgeReceipt,
   createPublicPledge,
+  fulfillQueuePledge,
   fulfillPledge,
   listChurchPledges,
   listPledges,
